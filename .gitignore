@@ -1,0 +1,25 @@
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+*.log
+
+# Encrypted / sensitive overrides
+*.gpg
+*.age
+
+# Local-only notes (optional: uncomment to ignore)
+# local/
+# private/
