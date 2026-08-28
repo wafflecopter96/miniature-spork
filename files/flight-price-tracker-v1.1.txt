@@ -1,0 +1,4322 @@
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/.dockerignore
+================================================================================
+
+.git
+.gitignore
+.env
+.venv
+__pycache__
+.pytest_cache
+output
+*.txt
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/.env.example
+================================================================================
+
+# Provider credentials. Configure only providers enabled in tracked_routes.yaml.
+SERPAPI_API_KEY=
+DUFFEL_ACCESS_TOKEN=
+# Prefer file-based secrets in Docker/Kubernetes so values are not copied into
+# container metadata. Direct values above remain supported for local use.
+SERPAPI_API_KEY_FILE=
+DUFFEL_ACCESS_TOKEN_FILE=
+
+# Stable paths inside the container.
+TRACKING_CONFIG=/app/config/tracked_routes.yaml
+OUTPUT_ROOT=/app/output
+
+# landing_zone | postgres | both
+STORAGE_MODE=landing_zone
+DATABASE_URL=
+
+# Safety / behavior.
+MAX_REQUESTS_PER_RUN=200
+REQUEST_TIMEOUT_SECONDS=45
+REQUEST_RETRIES=3
+FAIL_ON_PARTIAL=true
+SKIP_SUCCESSFUL_RUN=true
+LOG_LEVEL=INFO
+
+# Require the process to see proxy configuration before making outbound requests.
+REQUIRE_PROXY=false
+
+# Shared HTTP CONNECT proxy. Enable these in environments where proton-egress is reachable.
+# HTTP_PROXY=http://proton-egress:8888
+# HTTPS_PROXY=http://proton-egress:8888
+# http_proxy=http://proton-egress:8888
+# https_proxy=http://proton-egress:8888
+NO_PROXY=localhost,127.0.0.1
+no_proxy=localhost,127.0.0.1
+
+====================================================================================================
+
+# Optional deterministic logical-run context. Airflow supplies all three.
+RUN_ID=
+LOGICAL_AT=
+ANCHOR_DATE=
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/.github/workflows/ci.yml
+================================================================================
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - run: pytest
+      - run: python -m compileall -q src tests
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/.gitignore
+================================================================================
+
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+output/
+.idea/
+.vscode/
+.DS_Store
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/Dockerfile
+================================================================================
+
+FROM python:3.12-slim-bookworm AS runtime
+
+ARG APP_UID=1000
+ARG APP_GID=1000
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TRACKING_CONFIG=/app/config/tracked_routes.yaml \
+    OUTPUT_ROOT=/app/output
+
+# iptables is present because the same immutable image is also used by the
+# Kubernetes egress-lockdown init container. ca-certificates is explicit.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates iptables \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home app
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install ".[postgres]"
+
+COPY config ./config
+
+RUN mkdir -p /app/output \
+    && chown -R app:app /app/output /app/config
+
+USER app
+
+ENTRYPOINT ["python", "-m", "flight_price_tracker"]
+CMD ["collect"]
+
+FROM runtime AS test
+
+USER root
+COPY orchestration ./orchestration
+COPY deploy ./deploy
+COPY tests ./tests
+RUN pip install ".[dev]" \
+    && PYTHONPATH=/app pytest
+
+FROM runtime AS final
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/Makefile
+================================================================================
+
+.PHONY: install test validate plan build collect combine
+
+install:
+	python -m pip install -e ".[dev,postgres]"
+
+test:
+	pytest
+
+validate:
+	python -m flight_price_tracker validate-config --config config/tracked_routes.yaml
+
+plan:
+	python -m flight_price_tracker plan --config config/tracked_routes.yaml
+
+build:
+	docker build --target final -t flight-price-tracker:dev .
+
+container-test:
+	docker build --target test .
+
+collect:
+	docker compose -f deploy/docker/docker-compose.yml run --rm tracker collect
+
+combine:
+	bash scripts/combine_repo.sh . /tmp/flight-price-tracker-combined.txt
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/README.md
+================================================================================
+
+# Flight Price Tracker
+
+A run-once, execution-location-agnostic flight price collector designed to run from the
+same OCI image under:
+
+- `docker run`
+- Docker Compose
+- Airflow `DockerOperator`
+- Airflow `KubernetesPodOperator`
+
+The application has no internal scheduler. One invocation performs a bounded collection,
+persists the result, and exits.
+
+## Design goals
+
+1. **One image everywhere.** Docker and Kubernetes execute the same command and container paths.
+2. **No node-specific application logic.** Hostnames, credentials, proxy endpoints, and storage
+   locations are injected at runtime.
+3. **Centralized egress.** HTTP(S) requests can be forced through the shared
+   `proton-egress:8888` proxy. The hardened Kubernetes example uses a pod-network
+   fail-closed egress rule that permits DNS plus the proxy only.
+4. **Centralized persistence.** Durable data is written below
+   `/app/output/flight-price-tracker` on the shared tracker landing zone. Do not rely on
+   the container filesystem or worker-node-local storage.
+5. **Raw + normalized history.** Every successful provider response is retained verbatim,
+   then normalized into a stable observation contract.
+6. **Idempotent orchestration.** A deterministic `RUN_ID` can be supplied by Airflow. A
+   successfully completed run can be skipped on retry.
+7. **Cost bounded.** The collector calculates the number of outbound provider searches
+   before executing them and refuses to exceed `MAX_REQUESTS_PER_RUN`.
+8. **Explicit partial failure.** Successful raw responses are retained, failures are listed
+   in the manifest, and `_SUCCESS` is written only when the configured run succeeds.
+
+## Current providers
+
+- **SerpApi Google Flights**: consumer-facing Google Flights search results.
+- **Duffel**: structured airline offers through Duffel's Air API.
+
+Provider adapters are intentionally isolated so additional sources can be added without
+changing orchestration or storage code.
+
+## Repository layout
+
+```text
+flight-price-tracker/
+├── config/
+│   └── tracked_routes.yaml
+├── deploy/
+│   ├── docker/
+│   └── k8s/
+├── docs/
+├── orchestration/
+│   └── airflow/
+├── scripts/
+├── src/
+│   └── flight_price_tracker/
+├── tests/
+├── .dockerignore
+├── .env.example
+├── .gitignore
+├── Dockerfile
+├── Makefile
+└── pyproject.toml
+```
+
+## Quick start
+
+### 1. Configure targets
+
+Edit:
+
+```text
+config/tracked_routes.yaml
+```
+
+The production configuration tracks one-way nonstop searches from YYZ to PVG, PEK, and
+CAN for every date from 2026-11-01 through 2026-12-31. Past departure dates are removed
+from each new plan automatically.
+
+### 2. Create an environment file
+
+```bash
+cp .env.example .env
+```
+
+Populate at least one provider credential corresponding to the enabled providers.
+
+### 3. Validate and inspect the collection plan
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml run --rm tracker validate-config
+docker compose -f deploy/docker/docker-compose.yml run --rm tracker plan
+```
+
+`plan` performs no provider requests.
+
+### 4. Run one collection
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml run --rm tracker collect
+```
+
+Or directly:
+
+```bash
+docker build -t flight-price-tracker:dev .
+docker run --rm \
+  --env-file .env \
+  -v "$PWD/config/tracked_routes.yaml:/app/config/tracked_routes.yaml:ro" \
+  -e OUTPUT_ROOT=/app/output/flight-price-tracker \
+  -v "/var/lib/tracker-data:/app/output" \
+  flight-price-tracker:dev collect
+```
+
+## Output contract
+
+Each run is written under:
+
+```text
+/app/output/flight-price-tracker/
+└── collection_date=<YYYY-MM-DD>/run_id=<RUN_ID>/
+    ├── run_definition.json
+    ├── raw/provider=<PROVIDER>/origin=<IATA>/destination=<IATA>/
+    │   └── departure_date=<YYYY-MM-DD>/request_key=<SHA256>/
+    │       ├── request.json
+    │       ├── response.json
+    │       ├── observations.ndjson
+    │       ├── metadata.json
+    │       └── _SUCCESS
+    ├── normalized/provider=<PROVIDER>/origin=<IATA>/destination=<IATA>/
+    │   └── departure_date=<YYYY-MM-DD>/observations.ndjson
+    ├── manifest.json
+    └── _SUCCESS
+```
+
+Failed runs have `manifest.json` plus `_FAILED`, but never `_SUCCESS`.
+
+A supplied deterministic `RUN_ID`, such as an Airflow logical timestamp, means retries
+reuse the same run directory instead of silently creating a second historical observation
+window.
+
+See:
+
+- `docs/ARCHITECTURE.md`
+- `docs/DATA_CONTRACT.md`
+- `docs/DEPLOYMENT.md`
+- `docs/NETWORK_AND_STORAGE.md`
+- `docs/COST_CONTROL.md`
+
+## Important API behavior
+
+Flight offers are observations, not immutable facts. Offers can expire quickly, multiple
+fare products can exist for the same physical flight, and different providers can expose
+different inventories. The tracker therefore stores provider, collection timestamp,
+itinerary identity, fare metadata, and price rather than reducing a flight to one
+"historical price."
+
+## Production recommendation
+
+The production DAG is `flight_price_tracker_yyz_china`. It runs at minute 17 every four
+hours in `America/Toronto`, ends on 2027-01-01, and can select DockerOperator or
+KubernetesPodOperator without changing the application contract. Keep it paused until a
+SerpApi key is installed and the request budget in `docs/COST_CONTROL.md` is accepted.
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/config/tracked_routes.yaml
+================================================================================
+
+version: 1
+
+defaults:
+  providers:
+    - serpapi
+  cabin_class: economy
+  currency: CAD
+  adults: 1
+  nonstop_only: true
+  skip_past_dates: true
+  country: ca
+  language: en
+  serpapi_deep_search: false
+
+targets:
+  # One-way searches from Toronto. Each target expands to every calendar date
+  # from 2026-11-01 through 2026-12-31 (61 searches per target before November).
+  # stops=nonstop is sent upstream and is enforced again after normalization.
+  - id: yyz-pvg-nonstop
+    enabled: true
+    origin: YYZ
+    destination: PVG
+    include_airlines: []
+    flight_numbers: []
+    dates:
+      mode: calendar_range
+      start_date: "2026-11-01"
+      end_date: "2026-12-31"
+      step_days: 1
+
+  - id: yyz-pek-nonstop
+    enabled: true
+    origin: YYZ
+    destination: PEK
+    include_airlines: []
+    flight_numbers: []
+    dates:
+      mode: calendar_range
+      start_date: "2026-11-01"
+      end_date: "2026-12-31"
+      step_days: 1
+
+  - id: yyz-can-nonstop
+    enabled: true
+    origin: YYZ
+    destination: CAN
+    include_airlines: []
+    flight_numbers: []
+    dates:
+      mode: calendar_range
+      start_date: "2026-11-01"
+      end_date: "2026-12-31"
+      step_days: 1
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/deploy/docker/docker-compose.yml
+================================================================================
+
+services:
+  tracker:
+    build:
+      context: ../..
+    image: ${FLIGHT_TRACKER_IMAGE:-flight-price-tracker:dev}
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      TRACKING_CONFIG: /app/config/tracked_routes.yaml
+      OUTPUT_ROOT: /app/output/flight-price-tracker
+      MAX_REQUESTS_PER_RUN: ${MAX_REQUESTS_PER_RUN:-200}
+      REQUIRE_PROXY: ${REQUIRE_PROXY:-true}
+      HTTP_PROXY: ${HTTP_PROXY:-http://proton-egress:8888}
+      HTTPS_PROXY: ${HTTPS_PROXY:-http://proton-egress:8888}
+      http_proxy: ${HTTP_PROXY:-http://proton-egress:8888}
+      https_proxy: ${HTTPS_PROXY:-http://proton-egress:8888}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+      no_proxy: ${NO_PROXY:-localhost,127.0.0.1}
+    volumes:
+      - ../../config/tracked_routes.yaml:/app/config/tracked_routes.yaml:ro
+      - ${FLIGHT_TRACKER_OUTPUT_HOST_PATH:-/var/lib/tracker-data}:/app/output
+    networks:
+      - proton-egress
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  proton-egress:
+    external: true
+    name: ${PROTON_EGRESS_DOCKER_NETWORK:-proton-egress}
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/deploy/k8s/base/configmap.yaml
+================================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flight-price-tracker-config
+  namespace: private-apps
+data:
+  TRACKING_CONFIG: /app/config/tracked_routes.yaml
+  OUTPUT_ROOT: /app/output/flight-price-tracker
+  STORAGE_MODE: landing_zone
+  MAX_REQUESTS_PER_RUN: "200"
+  REQUEST_TIMEOUT_SECONDS: "45"
+  REQUEST_RETRIES: "3"
+  FAIL_ON_PARTIAL: "true"
+  SKIP_SUCCESSFUL_RUN: "true"
+  REQUIRE_PROXY: "true"
+  LOG_LEVEL: INFO
+  HTTP_PROXY: http://proton-egress:8888
+  HTTPS_PROXY: http://proton-egress:8888
+  http_proxy: http://proton-egress:8888
+  https_proxy: http://proton-egress:8888
+  NO_PROXY: localhost,127.0.0.1
+  no_proxy: localhost,127.0.0.1
+  tracked_routes.yaml: |
+    version: 1
+
+    defaults:
+      providers:
+        - serpapi
+      cabin_class: economy
+      currency: CAD
+      adults: 1
+      nonstop_only: true
+      skip_past_dates: true
+      country: ca
+      language: en
+      serpapi_deep_search: false
+
+    targets:
+      # One-way searches from Toronto. Each target expands to every calendar date
+      # from 2026-11-01 through 2026-12-31 (61 searches per target before November).
+      # stops=nonstop is sent upstream and is enforced again after normalization.
+      - id: yyz-pvg-nonstop
+        enabled: true
+        origin: YYZ
+        destination: PVG
+        include_airlines: []
+        flight_numbers: []
+        dates:
+          mode: calendar_range
+          start_date: "2026-11-01"
+          end_date: "2026-12-31"
+          step_days: 1
+
+      - id: yyz-pek-nonstop
+        enabled: true
+        origin: YYZ
+        destination: PEK
+        include_airlines: []
+        flight_numbers: []
+        dates:
+          mode: calendar_range
+          start_date: "2026-11-01"
+          end_date: "2026-12-31"
+          step_days: 1
+
+      - id: yyz-can-nonstop
+        enabled: true
+        origin: YYZ
+        destination: CAN
+        include_airlines: []
+        flight_numbers: []
+        dates:
+          mode: calendar_range
+          start_date: "2026-11-01"
+          end_date: "2026-12-31"
+          step_days: 1
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/docs/ARCHITECTURE.md
+================================================================================
+
+# Architecture
+
+## Execution model
+
+The tracker is intentionally a **run-once batch collector**:
+
+```text
+start
+  -> load and validate configuration
+  -> resolve calendar-range/rolling/explicit departure dates
+  -> calculate request budget
+  -> query configured providers
+  -> preserve raw responses
+  -> normalize offers
+  -> apply exact-flight/airline filters
+  -> write normalized observations
+  -> optionally upsert PostgreSQL
+  -> write manifest + _SUCCESS
+  -> exit
+```
+
+Scheduling belongs to Airflow, not the application.
+
+## Why this boundary
+
+Flight-price collection does not require a continuously resident process. Keeping the
+application run-once provides:
+
+- deterministic collection windows
+- natural retries
+- easy Docker/Kubernetes parity
+- lower idle resource use
+- simpler deployment and shutdown behavior
+- explicit success/failure semantics
+
+## Components
+
+### Configuration
+
+`config.py` parses environment settings and `tracked_routes.yaml`.
+
+The YAML defines *what* to collect. Environment variables define *how/where* the same
+image executes.
+
+### Provider adapters
+
+`collectors/serpapi.py` and `collectors/duffel.py` own provider-specific request/response
+logic. They return the same `PriceObservation` domain model.
+
+Nothing outside an adapter should depend on a provider's native schema.
+
+### Filtering
+
+Provider-side filters are used when available to save quota and response volume. The
+canonical filtering layer is still applied after normalization, especially for exact
+flight numbers that an upstream search API may not support directly.
+
+### Landing zone
+
+The landing zone is the durable system-of-record for collection output.
+
+The collector always keeps raw provider JSON before considering the run complete.
+Normalized NDJSON is derived from those raw responses.
+
+### PostgreSQL
+
+PostgreSQL is optional. It is a query-serving sink, not the only copy of source data.
+`STORAGE_MODE=both` gives raw/normalized landing-zone output plus relational query access.
+
+If Kubernetes is configured with strict proxy-only pod egress, direct PostgreSQL access
+must either be explicitly allowed or the Kubernetes execution should stay
+`STORAGE_MODE=landing_zone` and let a downstream local load process populate PostgreSQL.
+
+## Idempotency
+
+Airflow should set:
+
+```text
+RUN_ID=<logical UTC timestamp>
+```
+
+The run directory becomes deterministic. When `_SUCCESS` already exists and
+`SKIP_SUCCESSFUL_RUN=true`, a retry exits without collecting a second observation.
+
+Within PostgreSQL, `(run_id, record_key)` is unique.
+
+## Failure semantics
+
+A provider/date request is one collection unit.
+
+- Successful raw responses are written immediately.
+- Failures are accumulated into `manifest.json`.
+- `_SUCCESS` is emitted only when the run satisfies the configured failure policy.
+- `_FAILED` marks an unsuccessful run.
+- With `FAIL_ON_PARTIAL=true`, any exhausted provider request causes a non-zero process exit.
+
+This preserves evidence from partial runs while preventing downstream consumers from
+mistaking them for complete snapshots.
+
+## Deterministic logical-run contract
+
+`RunContext` separates immutable logical identity (`RUN_ID`, `LOGICAL_AT`, `ANCHOR_DATE`) from `attempt_started_at`. The latter is observability-only. Durable runs are keyed by `/app/output/flight-price-tracker/collection_date=<DATE>/run_id=<RUN_ID>/`; the immutable `run_definition.json` binds that ID to logical time, anchor, application version, tracking-config SHA256, canonical-plan SHA256, and complete request definitions. A mismatch fails before provider calls.
+
+Each canonical request has a SHA256 `request_key` and its own checkpoint directory. Completed checkpoints are validated and reused on retry; only missing units are fetched. Provider observation timestamps remain the actual fetch timestamps. Final normalized NDJSON is rebuilt from checkpoints in deterministic order, and `_SUCCESS` is published last and makes the run immutable.
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/docs/COST_CONTROL.md
+================================================================================
+
+# Cost and Request Control
+
+Flight search APIs are usually metered. A configuration that appears small can multiply
+quickly.
+
+## Request formula
+
+For the current implementation:
+
+```text
+requests per run =
+sum over enabled targets (
+    resolved departure dates
+    x enabled providers
+)
+```
+
+Example:
+
+```text
+2 routes
+x 90 departure dates
+x 2 providers
+x 6 runs/day
+= 2,160 provider searches/day
+```
+
+## Deployed 2026 tracking plan
+
+Before November, the configured three one-way routes expand to:
+
+```text
+3 routes x 61 departure dates x 1 provider = 183 searches/run
+183 x 6 four-hour runs/day = 1,098 searches/day
+```
+
+At six runs per day from 2026-08-28 through 2026-12-31, the full schedule is over
+100,000 SerpApi searches. The daily count declines during November and December because
+past departure dates are skipped. Confirm the provider plan/quota and expected bill
+before unpausing the DAG.
+
+## Hard guard
+
+Before making any network request, the application compares its plan with:
+
+```text
+MAX_REQUESTS_PER_RUN
+```
+
+If the plan exceeds the limit, the entire run fails before consuming quota.
+
+## Recommended rollout
+
+1. Install the provider credential without placing it in source control.
+2. Run one controlled collection and validate raw/normalized data quality.
+3. Measure actual provider request usage and latency.
+4. Unpause the four-hour DAG only after accepting the calculated consumption.
+5. Add Duffel only where cross-source comparison is worth doubling request volume.
+
+## Collection cadence
+
+Pricing does not need uniform cadence at every booking horizon.
+
+A future optimization is adaptive cadence, for example:
+
+```text
+90-180 days before departure: 1/day
+30-89 days:                  2/day
+7-29 days:                   4/day
+0-6 days:                    6/day
+```
+
+Keep that optimization in orchestration/configuration rather than converting the
+application into a permanent scheduler.
+
+## Deep search
+
+SerpApi `deep_search=true` is intentionally configurable per target. It can provide
+closer parity with browser Google Flights results but costs more latency and potentially
+more provider resources. Do not enable it globally without validating the benefit.
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/docs/DATA_CONTRACT.md
+================================================================================
+
+# Data Contract
+
+## Why the observation is not just "flight + price"
+
+A flight can have multiple simultaneous prices because of:
+
+- provider/source
+- cabin
+- fare product
+- baggage/refund rules
+- point of sale
+- passenger count
+- available inventory
+- codeshare/marketing carrier
+- itinerary construction
+
+The normalized record therefore retains enough identity to avoid collapsing distinct
+offers into one misleading price.
+
+## Normalized observation
+
+Each line in a Hive-partitioned
+`normalized/provider=*/origin=*/destination=*/departure_date=*/observations.ndjson`
+file contains:
+
+| Field | Meaning |
+|---|---|
+| `provider` | `serpapi`, `duffel`, etc. |
+| `collected_at` | UTC observation timestamp |
+| `target_id` | Stable configured tracking target |
+| `search_origin` | Requested origin IATA |
+| `search_destination` | Requested destination IATA |
+| `search_departure_date` | Requested local departure date |
+| `cabin_class` | Requested cabin |
+| `currency` | Price currency |
+| `total_amount` | Displayed/offer total |
+| `base_amount` | Base fare when provider exposes it |
+| `tax_amount` | Tax amount when provider exposes it |
+| `provider_offer_id` | Provider-specific ephemeral offer/token where available |
+| `itinerary_signature` | Stable hash of segment identity and times |
+| `total_duration_minutes` | Total known itinerary duration |
+| `stops` | Number of connections |
+| `fare_brand` | Fare brand when reliably available |
+| `segments` | Ordered physical/marketing flight segments |
+| `source_bucket` | Provider-specific result grouping |
+| `provider_metadata` | Additional source fields retained without polluting core schema |
+| `record_key` | Deterministic record identity within a run |
+
+## Segment
+
+Each segment contains:
+
+- origin/destination
+- local departure/arrival timestamps as returned by the provider
+- duration
+- marketing carrier code/name
+- operating carrier code/name when available
+- normalized flight number
+- aircraft when available
+
+## Raw contract
+
+Raw API JSON is never reshaped before persistence. This matters because upstream schemas
+and the normalized contract can evolve later.
+
+SerpApi represents some valid Google Flights searches with no matching itinerary as an
+`error` field saying that Google Flights returned no results. The collector persists and
+checkpoints that response as a successful empty search; other provider errors still fail
+the request.
+
+## Recommended downstream modeling
+
+A dbt layer can derive:
+
+1. `stg_flight_price_observations`
+2. `int_flight_itinerary_prices`
+3. `gld_current_flight_prices`
+4. `gld_flight_price_history`
+5. `gld_flight_price_changes`
+6. `gld_booking_window_statistics`
+
+For historical analysis, compare observations by a stable target/itinerary signature and
+lead time:
+
+```text
+days_to_departure = search_departure_date - collected_at::date
+```
+
+Do not join solely on flight number because the same flight number recurs on different
+dates and schedules can change.
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/docs/DEPLOYMENT.md
+================================================================================
+
+# Deployment
+
+## Prerequisites
+
+Common:
+
+- reachable centralized HTTP CONNECT proxy if `REQUIRE_PROXY=true`
+- provider credentials
+- durable landing-zone directory
+- immutable built image
+
+Docker:
+
+- external `proton-egress` Docker network
+- proxy container/service reachable as `proton-egress:8888`
+- shared landing-zone host path
+
+Kubernetes:
+
+- existing `private-apps` namespace and `registry-runner` service account
+- `flight-price-tracker-config` ConfigMap
+- `flight-price-tracker-secrets` Secret
+- existing `proton-egress` Service + EndpointSlice
+- existing bound `tracker-output` RWX PVC
+- application image available to the worker node
+
+## Docker validation
+
+```bash
+cp .env.example .env
+# populate keys and host output path as needed
+
+docker compose -f deploy/docker/docker-compose.yml build
+docker compose -f deploy/docker/docker-compose.yml run --rm tracker validate-config
+docker compose -f deploy/docker/docker-compose.yml run --rm tracker plan
+docker compose -f deploy/docker/docker-compose.yml run --rm tracker collect
+```
+
+## Kubernetes preparation
+
+The cluster-wide namespace, registry pull secret, proxy endpoint, and shared PVC already
+exist. Apply only the application ConfigMap:
+
+```bash
+kubectl apply -f deploy/k8s/base/configmap.yaml
+```
+
+Create the provider Secret from a mode-restricted file without putting the key on a
+command line:
+
+```bash
+kubectl -n private-apps create secret generic flight-price-tracker-secrets \
+  --from-file=serpapi-api-key=/home/g/.config/flight-price-tracker/serpapi-api-key \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Verify prerequisites before running anything:
+
+```bash
+kubectl -n private-apps get pvc tracker-output
+kubectl -n private-apps get configmap flight-price-tracker-config
+kubectl -n private-apps get secret flight-price-tracker-secrets
+```
+
+It must be `Bound`.
+
+Verify proxy name resolution/reachability from a disposable test pod or a controlled
+validation job before enabling scheduled collection.
+
+Airflow's KubernetesPodOperator supplies the digest-pinned image and full hardened Pod
+template; no independent CronJob is enabled in production.
+
+## Scheduling ownership
+
+Choose one scheduler:
+
+### Airflow
+
+Preferred when this data feeds an existing data pipeline, needs dependencies, retries,
+backfills, or downstream dbt work.
+
+Do not enable an independent Kubernetes CronJob for the same target/cadence unless
+duplicate provider requests are intentional.
+
+## Airflow backend switch
+
+The production DAG uses:
+
+```text
+FLIGHT_COLLECTION_OPERATOR=docker
+```
+
+or:
+
+```text
+FLIGHT_COLLECTION_OPERATOR=kubernetes
+```
+
+The switch changes placement/orchestration, not application behavior.
+
+## Production image workflow
+
+1. Build once.
+2. Run tests.
+3. Push image.
+4. Record digest.
+5. Deploy the same digest to Docker/Airflow and Kubernetes/Airflow.
+6. Change configuration independently from image code where practical.
+
+## Backfills
+
+A historical API backfill is not assumed. To reproduce a *collection run* with a past
+anchor date:
+
+```bash
+python -m flight_price_tracker plan \
+  --config config/tracked_routes.yaml \
+  --anchor-date 2026-08-28
+```
+
+That changes which future departure dates are searched today; it does not recreate prices
+that existed on August 28. Historical prices only exist if they were actually observed
+and persisted at that time.
+
+## Installed Airflow schedule
+
+`flight_price_tracker_yyz_china` runs at `17 */4 * * *` in
+`America/Toronto`, with `catchup=False`, one active run, and an end date of
+2027-01-01. The DAG remains paused until credentials and provider consumption are
+approved.
+
+## Logical-run values
+
+Airflow is the canonical production scheduler. Both DockerOperator and
+KubernetesPodOperator pass exactly `RUN_ID`, `LOGICAL_AT`, and `ANCHOR_DATE`, derived
+from `dag_run.logical_date or dag_run.start_date` for Airflow 3 manual-run compatibility.
+The run ID and timestamp use UTC; the anchor date uses `America/Toronto` so an evening
+run does not prematurely discard the current local departure date.
+
+## Hardened KPO contract
+
+The DAG imports `FlightTrackerSettings` and `kubernetes_pod_template()` from `orchestration/airflow/flight_tracker_task.py`. The reusable Pod template mirrors the standalone Job: output preflight, fail-closed Proton egress init, restricted `base` container, RWX `/app/output`, read-only tracked routes, bounded `/tmp` and `/run`, explicit resources, dedicated service account with token automount disabled, and role-based `worker|control-plane|any` placement.
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/docs/NETWORK_AND_STORAGE.md
+================================================================================
+
+# Network and Storage Policy
+
+This repository follows the same portability principle as the existing scraper pattern:
+the application must not care whether it runs on the local Docker host or a Kubernetes
+worker.
+
+## Stable container contract
+
+Both execution modes use:
+
+```text
+configuration: /app/config/tracked_routes.yaml
+output root:   /app/output/flight-price-tracker
+proxy:         http://proton-egress:8888
+command:       python -m flight_price_tracker collect
+UID/GID:       1000/1000
+```
+
+Only the orchestrator's mounting/network implementation changes.
+
+## Docker
+
+The Compose example joins an existing external Docker network called `proton-egress`.
+The central proxy is expected to be resolvable as:
+
+```text
+proton-egress:8888
+```
+
+Durable storage is a host bind mount:
+
+```text
+/var/lib/tracker-data -> /app/output
+```
+
+The tracker is not allowed to depend on anonymous Docker volumes.
+
+## Kubernetes
+
+### Proxy
+
+Kubernetes receives the same logical hostname through:
+
+```text
+Service proton-egress
+        +
+EndpointSlice -> externally reachable proxy address
+```
+
+The application still sees:
+
+```text
+http://proton-egress:8888
+```
+
+No application code contains the proxy host's physical IP.
+
+### Fail-closed egress
+
+The hardened KubernetesPodOperator template uses an init container in the pod network namespace to set:
+
+```text
+OUTPUT policy = DROP
+allow loopback
+allow established/related
+allow DNS
+allow TCP to proton-egress:8888
+```
+
+The main application container itself has no Linux capabilities and runs read-only as
+UID 1000.
+
+This protects against accidentally sending a provider request directly to the internet
+when proxy variables are missing or ignored.
+
+`REQUIRE_PROXY=true` adds an application-level configuration check as a second guard.
+
+### Storage
+
+The existing `private-apps/tracker-output` PVC is `ReadWriteMany` and is backed by the
+centralized `/var/lib/tracker-data` NFS export. Both runtimes write the dataset at:
+
+```text
+canonical host/NFS: /var/lib/tracker-data/flight-price-tracker
+physical SSD:       /srv/landing/trackers/flight-price-tracker
+container:          /app/output/flight-price-tracker
+```
+
+```text
+Docker host                     Kubernetes worker
+     |                                |
+bind mount                         RWX PVC
+     |                                |
+     +--------- central landing zone -+
+```
+
+There is intentionally **no worker-node-local fallback**. If the PVC cannot bind/mount,
+the Kubernetes job should not start.
+
+The example static PV is kept separate because the NFS server address is infrastructure
+specific.
+
+## PostgreSQL and strict egress
+
+A direct PostgreSQL connection is not HTTP proxy traffic. With the provided strict
+Kubernetes iptables policy it will be blocked.
+
+Recommended default:
+
+```text
+Kubernetes collector -> shared landing zone
+downstream/local job  -> PostgreSQL
+```
+
+If direct PostgreSQL writes from Kubernetes become necessary, explicitly add the
+database endpoint/port to the pod egress allowlist rather than weakening the policy to
+general internet access.
+
+## Secrets
+
+Never place API tokens in:
+
+- image layers
+- tracked YAML
+- ConfigMaps
+- command-line arguments
+- repository `.env`
+
+DockerOperator mounts the mode-restricted host key file read-only. KubernetesPodOperator
+mounts the `private-apps/flight-price-tracker-secrets` Secret read-only. The application
+reads `/run/secrets/serpapi-api-key` in either runtime.
+
+## Image identity
+
+Production orchestration should pin an immutable digest:
+
+```text
+registry.example/flight-price-tracker@sha256:...
+```
+
+Do not let the Docker path run one mutable `latest` image while Kubernetes runs another.
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/orchestration/__init__.py
+================================================================================
+
+
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/orchestration/airflow/__init__.py
+================================================================================
+
+
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/orchestration/airflow/dags/flight_price_tracker.py
+================================================================================
+
+"""Collect YYZ-to-China nonstop flight prices every four hours."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pathlib import Path
+import sys
+from zoneinfo import ZoneInfo
+
+from airflow import DAG
+from airflow.timetables.trigger import CronTriggerTimetable
+
+
+_DAG_DIRECTORY = Path(__file__).resolve().parent
+for import_directory in (_DAG_DIRECTORY, _DAG_DIRECTORY.parent):
+    if str(import_directory) not in sys.path:
+        sys.path.insert(0, str(import_directory))
+
+from flight_tracker_task import build_collection_task
+
+
+with DAG(
+    dag_id="flight_price_tracker_yyz_china",
+    description=(
+        "Track nonstop YYZ-PVG, YYZ-PEK, and YYZ-CAN prices for "
+        "November and December 2026."
+    ),
+    start_date=datetime(2026, 8, 28, tzinfo=ZoneInfo("America/Toronto")),
+    end_date=datetime(2027, 1, 1, tzinfo=ZoneInfo("America/Toronto")),
+    schedule=CronTriggerTimetable(
+        "17 */4 * * *",
+        timezone="America/Toronto",
+    ),
+    catchup=False,
+    max_active_runs=1,
+    tags=["flights", "prices", "yyz", "china", "portable"],
+    default_args={
+        "owner": "wafflecopter96",
+        "retries": 2,
+        "retry_delay": timedelta(minutes=15),
+    },
+) as dag:
+    build_collection_task()
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/orchestration/airflow/flight_tracker_task.py
+================================================================================
+
+"""Build a flight-price collection task for Docker or Kubernetes."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import timedelta
+import os
+from typing import Any, Mapping
+
+
+APP_CONFIG = "/app/config/tracked_routes.yaml"
+APP_OUTPUT_MOUNT = "/app/output"
+APP_OUTPUT_ROOT = "/app/output/flight-price-tracker"
+APP_SECRET = "/run/secrets/serpapi-api-key"
+CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
+DEFAULT_KILLSWITCH_IMAGE = (
+    "qmcgaw/gluetun:v3.41.1@sha256:"
+    "1a5bf4b4820a879cdf8d93d7ef0d2d963af56670c9ebff8981860b6804ebc8ab"
+)
+SUPPORTED_OPERATORS = {"docker", "kubernetes"}
+SUPPORTED_PLACEMENTS = {"worker", "control-plane", "any"}
+
+
+@dataclass(frozen=True)
+class FlightTrackerSettings:
+    operator: str
+    image: str
+    proxy_url: str
+    proxy_ip: str
+    proxy_port: int
+    docker_url: str
+    docker_conn_id: str
+    docker_network: str
+    docker_output_path: str
+    docker_config_path: str
+    docker_serpapi_key_path: str
+    kubernetes_conn_id: str
+    kubernetes_namespace: str
+    kubernetes_service_account: str
+    kubernetes_placement: str
+    kubernetes_output_pvc: str
+    kubernetes_config_map: str
+    kubernetes_secret: str
+    killswitch_image: str
+
+    @classmethod
+    def from_env(
+        cls, env: Mapping[str, str] | None = None
+    ) -> FlightTrackerSettings:
+        values = os.environ if env is None else env
+        operator = values.get("FLIGHT_COLLECTION_OPERATOR", "kubernetes").lower()
+        if operator not in SUPPORTED_OPERATORS:
+            raise ValueError(
+                "FLIGHT_COLLECTION_OPERATOR must be 'docker' or 'kubernetes'"
+            )
+
+        placement = values.get(
+            "FLIGHT_KUBERNETES_PLACEMENT",
+            values.get("SCRAPER_KUBERNETES_PLACEMENT", "worker"),
+        ).lower()
+        if placement not in SUPPORTED_PLACEMENTS:
+            raise ValueError(
+                "FLIGHT_KUBERNETES_PLACEMENT must be 'worker', "
+                "'control-plane', or 'any'"
+            )
+
+        proxy_port = int(values.get("FLIGHT_PROXY_PORT", "8888"))
+        if not 1 <= proxy_port <= 65535:
+            raise ValueError("FLIGHT_PROXY_PORT must be between 1 and 65535")
+
+        return cls(
+            operator=operator,
+            image=values.get(
+                "FLIGHT_PRICE_TRACKER_IMAGE", "flight-price-tracker:dev"
+            ),
+            proxy_url=values.get(
+                "FLIGHT_PROXY_URL", "http://proton-egress:8888"
+            ),
+            proxy_ip=values.get("FLIGHT_PROXY_IP", "100.123.158.31"),
+            proxy_port=proxy_port,
+            docker_url=values.get(
+                "FLIGHT_DOCKER_URL", "unix://var/run/docker.sock"
+            ),
+            docker_conn_id=values.get(
+                "FLIGHT_DOCKER_CONN_ID", "private_registry"
+            ),
+            docker_network=values.get(
+                "FLIGHT_DOCKER_NETWORK", "proton-egress"
+            ),
+            docker_output_path=values.get(
+                "FLIGHT_DOCKER_OUTPUT_PATH", "/var/lib/tracker-data"
+            ),
+            docker_config_path=values.get(
+                "FLIGHT_DOCKER_CONFIG_PATH",
+                "/home/g/projects/flight-price-tracker/config/tracked_routes.yaml",
+            ),
+            docker_serpapi_key_path=values.get(
+                "FLIGHT_DOCKER_SERPAPI_KEY_PATH",
+                "/home/g/.config/flight-price-tracker/serpapi-api-key",
+            ),
+            kubernetes_conn_id=values.get(
+                "FLIGHT_KUBERNETES_CONN_ID", "kubernetes_default"
+            ),
+            kubernetes_namespace=values.get(
+                "FLIGHT_KUBERNETES_NAMESPACE", "private-apps"
+            ),
+            kubernetes_service_account=values.get(
+                "FLIGHT_KUBERNETES_SERVICE_ACCOUNT", "registry-runner"
+            ),
+            kubernetes_placement=placement,
+            kubernetes_output_pvc=values.get(
+                "FLIGHT_KUBERNETES_OUTPUT_PVC", "tracker-output"
+            ),
+            kubernetes_config_map=values.get(
+                "FLIGHT_KUBERNETES_CONFIG_MAP", "flight-price-tracker-config"
+            ),
+            kubernetes_secret=values.get(
+                "FLIGHT_KUBERNETES_SECRET", "flight-price-tracker-secrets"
+            ),
+            killswitch_image=values.get(
+                "FLIGHT_KILLSWITCH_IMAGE",
+                values.get("RETAIL_KILLSWITCH_IMAGE", DEFAULT_KILLSWITCH_IMAGE),
+            ),
+        )
+
+
+def airflow_logical_env() -> dict[str, str]:
+    logical = "(dag_run.logical_date or dag_run.start_date)"
+    return {
+        "RUN_ID": "{{ " + logical + ".in_timezone('UTC').strftime('%Y%m%dT%H%M%SZ') }}",
+        "LOGICAL_AT": "{{ " + logical + ".in_timezone('UTC').isoformat() }}",
+        # Departure dates are local calendar dates at YYZ. Avoid dropping the
+        # current Toronto date when UTC has already rolled into tomorrow.
+        "ANCHOR_DATE": (
+            "{{ "
+            + logical
+            + ".in_timezone('America/Toronto').strftime('%Y-%m-%d') }}"
+        ),
+    }
+
+
+def proxy_environment(settings: FlightTrackerSettings) -> dict[str, str]:
+    return {
+        "HTTP_PROXY": settings.proxy_url,
+        "HTTPS_PROXY": settings.proxy_url,
+        "http_proxy": settings.proxy_url,
+        "https_proxy": settings.proxy_url,
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1",
+    }
+
+
+def kubernetes_placement_spec(placement: str) -> dict[str, Any]:
+    if placement == "worker":
+        return {
+            "affinity": {
+                "nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [
+                            {
+                                "matchExpressions": [
+                                    {
+                                        "key": CONTROL_PLANE_LABEL,
+                                        "operator": "DoesNotExist",
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    toleration = {
+        "key": CONTROL_PLANE_LABEL,
+        "operator": "Exists",
+        "effect": "NoSchedule",
+    }
+    if placement == "control-plane":
+        return {
+            "nodeSelector": {CONTROL_PLANE_LABEL: ""},
+            "tolerations": [toleration],
+        }
+    if placement == "any":
+        return {"tolerations": [toleration]}
+    raise ValueError(f"unsupported Kubernetes placement: {placement!r}")
+
+
+def restricted_security_context() -> dict[str, Any]:
+    return {
+        "runAsNonRoot": True,
+        "runAsUser": 1000,
+        "runAsGroup": 1000,
+        "allowPrivilegeEscalation": False,
+        "readOnlyRootFilesystem": True,
+        "capabilities": {"drop": ["ALL"]},
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+
+
+def kubernetes_pod_template(
+    settings: FlightTrackerSettings,
+) -> dict[str, Any]:
+    killswitch = "\n".join(
+        (
+            "dns_server=$(awk '/^nameserver / { print $2; exit }' /etc/resolv.conf)",
+            'test -n "$dns_server"',
+            "iptables -F OUTPUT",
+            "iptables -A OUTPUT -o lo -j ACCEPT",
+            "iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+            'iptables -A OUTPUT -p udp -d "$dns_server" --dport 53 -j ACCEPT',
+            'iptables -A OUTPUT -p tcp -d "$dns_server" --dport 53 -j ACCEPT',
+            f"iptables -A OUTPUT -p tcp -d {settings.proxy_ip} "
+            f"--dport {settings.proxy_port} -j ACCEPT",
+            "iptables -P OUTPUT DROP",
+        )
+    )
+    app_environment = {
+        **proxy_environment(settings),
+        "TRACKING_CONFIG": APP_CONFIG,
+        "OUTPUT_ROOT": APP_OUTPUT_ROOT,
+        "SERPAPI_API_KEY_FILE": APP_SECRET,
+    }
+
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "labels": {
+                "app.kubernetes.io/name": "flight-price-tracker",
+                "app.kubernetes.io/component": "airflow-collector",
+            }
+        },
+        "spec": {
+            "serviceAccountName": settings.kubernetes_service_account,
+            "automountServiceAccountToken": False,
+            "restartPolicy": "Never",
+            **kubernetes_placement_spec(settings.kubernetes_placement),
+            "initContainers": [
+                {
+                    "name": "verify-output-access",
+                    "image": settings.image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": [
+                        "python",
+                        "-c",
+                        (
+                            "from pathlib import Path; import tempfile; "
+                            f"p=Path('{APP_OUTPUT_ROOT}'); p.mkdir(exist_ok=True); "
+                            "tempfile.TemporaryFile(dir=p).close()"
+                        ),
+                    ],
+                    "securityContext": restricted_security_context(),
+                    "resources": {
+                        "requests": {
+                            "cpu": "10m",
+                            "memory": "16Mi",
+                            "ephemeral-storage": "8Mi",
+                        },
+                        "limits": {
+                            "cpu": "100m",
+                            "memory": "64Mi",
+                            "ephemeral-storage": "32Mi",
+                        },
+                    },
+                    "volumeMounts": [
+                        {"name": "output", "mountPath": APP_OUTPUT_MOUNT}
+                    ],
+                },
+                {
+                    "name": "configure-proton-egress",
+                    "image": settings.killswitch_image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["/bin/sh", "-ec", killswitch],
+                    "securityContext": {
+                        "runAsUser": 0,
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {
+                            "drop": ["ALL"],
+                            "add": ["NET_ADMIN"],
+                        },
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "resources": {
+                        "requests": {
+                            "cpu": "10m",
+                            "memory": "16Mi",
+                            "ephemeral-storage": "8Mi",
+                        },
+                        "limits": {
+                            "cpu": "100m",
+                            "memory": "64Mi",
+                            "ephemeral-storage": "32Mi",
+                        },
+                    },
+                    "volumeMounts": [{"name": "run", "mountPath": "/run"}],
+                },
+            ],
+            "containers": [
+                {
+                    # KubernetesPodOperator merges runtime fields into "base".
+                    "name": "base",
+                    "image": settings.image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "envFrom": [
+                        {
+                            "configMapRef": {
+                                "name": settings.kubernetes_config_map
+                            }
+                        }
+                    ],
+                    "env": [
+                        {"name": name, "value": value}
+                        for name, value in app_environment.items()
+                    ],
+                    "securityContext": restricted_security_context(),
+                    "resources": {
+                        "requests": {
+                            "cpu": "50m",
+                            "memory": "96Mi",
+                            "ephemeral-storage": "64Mi",
+                        },
+                        "limits": {
+                            "cpu": "1",
+                            "memory": "384Mi",
+                            "ephemeral-storage": "256Mi",
+                        },
+                    },
+                    "volumeMounts": [
+                        {"name": "output", "mountPath": APP_OUTPUT_MOUNT},
+                        {
+                            "name": "config",
+                            "mountPath": APP_CONFIG,
+                            "subPath": "tracked_routes.yaml",
+                            "readOnly": True,
+                        },
+                        {
+                            "name": "credentials",
+                            "mountPath": "/run/secrets",
+                            "readOnly": True,
+                        },
+                        {"name": "tmp", "mountPath": "/tmp"},
+                    ],
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "output",
+                    "persistentVolumeClaim": {
+                        "claimName": settings.kubernetes_output_pvc
+                    },
+                },
+                {
+                    "name": "config",
+                    "configMap": {"name": settings.kubernetes_config_map},
+                },
+                {
+                    "name": "credentials",
+                    "secret": {
+                        "secretName": settings.kubernetes_secret,
+                        "defaultMode": 0o444,
+                        "optional": True,
+                    },
+                },
+                {"name": "tmp", "emptyDir": {"sizeLimit": "64Mi"}},
+                {"name": "run", "emptyDir": {"sizeLimit": "1Mi"}},
+            ],
+        },
+    }
+
+
+def build_collection_task(
+    *,
+    task_id: str = "collect_flight_prices",
+    settings: FlightTrackerSettings | None = None,
+    **operator_kwargs: Any,
+) -> Any:
+    selected = settings or FlightTrackerSettings.from_env()
+    logical_environment = airflow_logical_env()
+    common = {
+        "task_id": task_id,
+        "do_xcom_push": False,
+        "execution_timeout": timedelta(hours=3),
+        **operator_kwargs,
+    }
+
+    if selected.operator == "docker":
+        from docker.types import Mount
+        from airflow.providers.docker.operators.docker import DockerOperator
+
+        return DockerOperator(
+            image=selected.image,
+            command=["collect"],
+            docker_url=selected.docker_url,
+            docker_conn_id=selected.docker_conn_id,
+            force_pull=True,
+            network_mode=selected.docker_network,
+            environment={
+                **proxy_environment(selected),
+                **logical_environment,
+                "TRACKING_CONFIG": APP_CONFIG,
+                "OUTPUT_ROOT": APP_OUTPUT_ROOT,
+                "SERPAPI_API_KEY_FILE": APP_SECRET,
+                "REQUIRE_PROXY": "true",
+                "MAX_REQUESTS_PER_RUN": "200",
+            },
+            mount_tmp_dir=False,
+            mounts=[
+                Mount(
+                    target=APP_CONFIG,
+                    source=selected.docker_config_path,
+                    type="bind",
+                    read_only=True,
+                ),
+                Mount(
+                    target=APP_SECRET,
+                    source=selected.docker_serpapi_key_path,
+                    type="bind",
+                    read_only=True,
+                ),
+                Mount(
+                    target=APP_OUTPUT_MOUNT,
+                    source=selected.docker_output_path,
+                    type="bind",
+                ),
+            ],
+            auto_remove="success",
+            labels={
+                "app": "flight-price-tracker",
+                "operator": "docker",
+            },
+            **common,
+        )
+
+    from airflow.providers.cncf.kubernetes.operators.pod import (
+        KubernetesPodOperator,
+    )
+
+    return KubernetesPodOperator(
+        name=task_id.replace("_", "-"),
+        namespace=selected.kubernetes_namespace,
+        image=selected.image,
+        arguments=["collect"],
+        kubernetes_conn_id=selected.kubernetes_conn_id,
+        pod_template_dict=kubernetes_pod_template(selected),
+        env_vars=logical_environment,
+        image_pull_policy="IfNotPresent",
+        get_logs=True,
+        log_events_on_failure=True,
+        on_finish_action="delete_pod",
+        startup_timeout_seconds=300,
+        **common,
+    )
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/pyproject.toml
+================================================================================
+
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flight-price-tracker"
+version = "0.2.2"
+description = "Portable run-once historical flight price collector"
+requires-python = ">=3.12"
+dependencies = [
+  "PyYAML>=6.0.2,<7",
+  "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+postgres = [
+  "psycopg[binary]>=3.2,<4",
+]
+dev = [
+  "pytest>=8.3,<9",
+]
+
+[project.scripts]
+flight-price-tracker = "flight_price_tracker.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"flight_price_tracker.storage" = ["schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/scripts/combine_repo.sh
+================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="${1:-.}"
+OUTPUT="${2:-./flight-price-tracker-combined.txt}"
+
+ROOT="$(cd "$ROOT" && pwd)"
+OUTPUT="$(realpath -m "$OUTPUT")"
+
+find "$ROOT" -type f \
+  ! -path "$ROOT/.git/*" \
+  ! -path "$ROOT/.venv/*" \
+  ! -path "$ROOT/__pycache__/*" \
+  ! -path "$ROOT/.pytest_cache/*" \
+  ! -path "$ROOT/output/*" \
+  ! -path "$OUTPUT" \
+  -print0 \
+| sort -z \
+| while IFS= read -r -d '' file; do
+    relative="${file#"$ROOT"/}"
+    printf '\n================================================================================\n'
+    printf 'FILE: %s\n' "$relative"
+    printf '================================================================================\n\n'
+    cat "$file"
+    printf '\n'
+  done > "$OUTPUT"
+
+echo "$OUTPUT"
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/scripts/run_local.sh
+================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+docker compose -f deploy/docker/docker-compose.yml run --rm tracker "$@"
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/scripts/validate.sh
+================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+python -m compileall -q src tests
+pytest
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/__init__.py
+================================================================================
+
+__version__ = "0.1.0"
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/__main__.py
+================================================================================
+
+from flight_price_tracker.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/cli.py
+================================================================================
+
+from __future__ import annotations
+import argparse, json, sys
+from datetime import date
+from flight_price_tracker import __version__
+from flight_price_tracker.config import Settings, load_tracking_config
+from flight_price_tracker.errors import FlightPriceTrackerError
+from flight_price_tracker.logging_config import configure_logging
+from flight_price_tracker.run_context import RunContext
+from flight_price_tracker.service import collect, plan_collection
+
+def build_parser():
+    p=argparse.ArgumentParser(prog='flight-price-tracker'); p.add_argument('--version',action='version',version=__version__)
+    subs=p.add_subparsers(dest='command',required=True)
+    for command in ('validate-config','plan','collect'):
+        s=subs.add_parser(command); s.add_argument('--config'); s.add_argument('--anchor-date')
+        s.add_argument('--logical-at')
+    c=subs.choices['collect']; c.add_argument('--run-id')
+    return p
+
+def main(argv=None):
+    args=build_parser().parse_args(argv)
+    try:
+        settings=Settings.from_env(args.config); configure_logging(settings.log_level); config=load_tracking_config(settings.config_path)
+        if args.command=='validate-config':
+            print(json.dumps({'valid':True,'config_path':str(settings.config_path),'enabled_targets':len(config.enabled_targets),'providers':sorted({p for t in config.enabled_targets for p in t.providers})},indent=2)); return 0
+        context=RunContext.resolve(cli_run_id=getattr(args,'run_id',None),cli_logical_at=args.logical_at,cli_anchor_date=args.anchor_date)
+        if args.command=='plan': print(json.dumps(plan_collection(config,settings,context.anchor_date),indent=2)); return 0
+        result=collect(config,settings,context); print(json.dumps(result,indent=2,default=str)); return 0 if result.get('exit_success',True) else 2
+    except (FlightPriceTrackerError,ValueError) as exc: print(f'ERROR: {exc}',file=sys.stderr); return 2
+if __name__=='__main__': raise SystemExit(main())
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/collectors/__init__.py
+================================================================================
+
+from flight_price_tracker.collectors.duffel import DuffelCollector
+from flight_price_tracker.collectors.serpapi import SerpApiCollector
+
+__all__ = ["DuffelCollector", "SerpApiCollector"]
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/collectors/base.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from flight_price_tracker.domain import PriceObservation, SearchRequest
+
+
+@dataclass
+class ProviderResult:
+    provider: str
+    request: SearchRequest
+    raw: dict[str, Any]
+    observations: list[PriceObservation]
+
+
+class Collector(Protocol):
+    provider_name: str
+
+    def collect(self, request: SearchRequest, collected_at: str) -> ProviderResult:
+        ...
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/collectors/duffel.py
+================================================================================
+
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any
+
+import requests
+
+from flight_price_tracker.collectors.base import ProviderResult
+from flight_price_tracker.domain import (
+    PriceObservation,
+    SearchRequest,
+    Segment,
+    build_itinerary_signature,
+    normalize_flight_number,
+)
+from flight_price_tracker.errors import CollectorError
+
+
+class DuffelCollector:
+    provider_name = "duffel"
+    endpoint = "https://api.duffel.com/air/offer_requests"
+
+    def __init__(
+        self,
+        access_token: str,
+        session: requests.Session,
+        timeout_seconds: float,
+    ) -> None:
+        self.access_token = access_token
+        self.session = session
+        self.timeout_seconds = timeout_seconds
+
+    def collect(self, request: SearchRequest, collected_at: str) -> ProviderResult:
+        body = {
+            "data": {
+                "slices": [
+                    {
+                        "origin": request.origin,
+                        "destination": request.destination,
+                        "departure_date": request.departure_date.isoformat(),
+                    }
+                ],
+                "passengers": [{"type": "adult"} for _ in range(request.adults)],
+                "cabin_class": request.cabin_class,
+                "max_connections": 0 if request.nonstop_only else 1,
+            }
+        }
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip",
+            "Duffel-Version": "v2",
+            "Authorization": f"Bearer {self.access_token}",
+        }
+
+        # Duffel recommends making supplier_timeout shorter than the caller's
+        # HTTP timeout so completed airline responses can still be returned.
+        supplier_timeout_ms = max(
+            2000,
+            min(60000, int(max(2.0, self.timeout_seconds - 5.0) * 1000)),
+        )
+
+        try:
+            response = self.session.post(
+                self.endpoint,
+                params={
+                    "return_offers": "true",
+                    "supplier_timeout": supplier_timeout_ms,
+                    "view": "offers",
+                },
+                headers=headers,
+                json=body,
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise CollectorError(f"Duffel request failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise CollectorError(
+                f"Duffel returned HTTP {response.status_code}: {response.text[:500]}"
+            )
+
+        try:
+            raw = response.json()
+        except ValueError as exc:
+            raise CollectorError("Duffel returned non-JSON content") from exc
+
+        data = raw.get("data")
+        if not isinstance(data, dict):
+            raise CollectorError("Duffel response does not contain an offer-request object")
+
+        observations = self.normalize(raw, request, collected_at)
+        return ProviderResult(
+            provider=self.provider_name,
+            request=request,
+            raw=raw,
+            observations=observations,
+        )
+
+    @staticmethod
+    def _airport_iata(value: Any) -> str:
+        if isinstance(value, dict):
+            return str(value.get("iata_code") or value.get("iata_city_code") or "")
+        return str(value or "")
+
+    @classmethod
+    def normalize(
+        cls,
+        raw: dict[str, Any],
+        request: SearchRequest,
+        collected_at: str,
+    ) -> list[PriceObservation]:
+        offer_request = raw.get("data") or {}
+        observations: list[PriceObservation] = []
+
+        for offer in offer_request.get("offers") or []:
+            segments: list[Segment] = []
+            for slice_ in offer.get("slices") or []:
+                for segment in slice_.get("segments") or []:
+                    marketing = segment.get("marketing_carrier") or {}
+                    operating = segment.get("operating_carrier") or {}
+                    flight_number = normalize_flight_number(
+                        f"{marketing.get('iata_code') or ''}"
+                        f"{segment.get('marketing_carrier_flight_number') or ''}"
+                    )
+                    segments.append(
+                        Segment(
+                            origin=cls._airport_iata(segment.get("origin")),
+                            destination=cls._airport_iata(segment.get("destination")),
+                            departure_time_local=segment.get("departing_at"),
+                            arrival_time_local=segment.get("arriving_at"),
+                            duration_minutes=_iso8601_duration_minutes(
+                                segment.get("duration")
+                            ),
+                            marketing_carrier_code=marketing.get("iata_code"),
+                            marketing_carrier_name=marketing.get("name"),
+                            operating_carrier_code=operating.get("iata_code"),
+                            operating_carrier_name=operating.get("name"),
+                            flight_number=flight_number,
+                            aircraft=(segment.get("aircraft") or {}).get("name"),
+                        )
+                    )
+
+            if not segments or offer.get("total_amount") is None:
+                continue
+
+            observation = PriceObservation(
+                provider=cls.provider_name,
+                collected_at=collected_at,
+                target_id=request.target_id,
+                search_origin=request.origin,
+                search_destination=request.destination,
+                search_departure_date=request.departure_date.isoformat(),
+                cabin_class=request.cabin_class,
+                currency=str(
+                    offer.get("total_currency") or request.currency
+                ).upper(),
+                total_amount=Decimal(str(offer["total_amount"])),
+                base_amount=(
+                    Decimal(str(offer["base_amount"]))
+                    if offer.get("base_amount") is not None
+                    else None
+                ),
+                tax_amount=(
+                    Decimal(str(offer["tax_amount"]))
+                    if offer.get("tax_amount") is not None
+                    else None
+                ),
+                provider_offer_id=offer.get("id"),
+                itinerary_signature=build_itinerary_signature(segments),
+                total_duration_minutes=sum(
+                    segment.duration_minutes or 0 for segment in segments
+                )
+                or None,
+                stops=max(0, len(segments) - 1),
+                fare_brand=None,
+                segments=segments,
+                source_bucket="offers",
+                provider_metadata={
+                    "expires_at": offer.get("expires_at"),
+                    "owner": offer.get("owner"),
+                    "live_mode": offer.get("live_mode"),
+                    "conditions": offer.get("conditions"),
+                    "payment_requirements": offer.get("payment_requirements"),
+                },
+            ).finalize()
+            observations.append(observation)
+
+        return observations
+
+
+def _iso8601_duration_minutes(value: str | None) -> int | None:
+    """Parse the PT#H#M subset used for flight segment durations."""
+    if not value or not value.startswith("PT"):
+        return None
+    body = value[2:]
+    hours = 0
+    minutes = 0
+    if "H" in body:
+        hour_text, body = body.split("H", 1)
+        hours = int(hour_text or 0)
+    if "M" in body:
+        minute_text = body.split("M", 1)[0]
+        minutes = int(minute_text or 0)
+    return hours * 60 + minutes
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/collectors/serpapi.py
+================================================================================
+
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any
+
+import requests
+
+from flight_price_tracker.collectors.base import ProviderResult
+from flight_price_tracker.domain import (
+    PriceObservation,
+    SearchRequest,
+    Segment,
+    build_itinerary_signature,
+    carrier_code_from_flight_number,
+    normalize_flight_number,
+)
+from flight_price_tracker.errors import CollectorError
+
+
+TRAVEL_CLASS = {
+    "economy": 1,
+    "premium_economy": 2,
+    "business": 3,
+    "first": 4,
+}
+
+
+class SerpApiCollector:
+    provider_name = "serpapi"
+    endpoint = "https://serpapi.com/search"
+
+    def __init__(
+        self,
+        api_key: str,
+        session: requests.Session,
+        timeout_seconds: float,
+    ) -> None:
+        self.api_key = api_key
+        self.session = session
+        self.timeout_seconds = timeout_seconds
+
+    def collect(self, request: SearchRequest, collected_at: str) -> ProviderResult:
+        params: dict[str, Any] = {
+            "engine": "google_flights",
+            "api_key": self.api_key,
+            "departure_id": request.origin,
+            "arrival_id": request.destination,
+            "outbound_date": request.departure_date.isoformat(),
+            "type": 2,
+            "travel_class": TRAVEL_CLASS[request.cabin_class],
+            "currency": request.currency,
+            "adults": request.adults,
+            "gl": request.country,
+            "hl": request.language,
+            "deep_search": str(request.serpapi_deep_search).lower(),
+        }
+        if request.nonstop_only:
+            params["stops"] = 1
+        if request.include_airlines:
+            params["include_airlines"] = ",".join(request.include_airlines)
+
+        try:
+            response = self.session.get(
+                self.endpoint,
+                params=params,
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise CollectorError(f"SerpApi request failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise CollectorError(
+                f"SerpApi returned HTTP {response.status_code}: {response.text[:500]}"
+            )
+
+        try:
+            raw = response.json()
+        except ValueError as exc:
+            raise CollectorError("SerpApi returned non-JSON content") from exc
+
+        if raw.get("error"):
+            error = str(raw["error"])
+            # Google Flights reports a valid empty search as an API-level
+            # error. For sparse nonstop routes this is expected data, not a
+            # failed collection unit. Preserve the response and checkpoint an
+            # empty observation list so retries do not spend another credit.
+            if "hasn't returned any results" in error.lower():
+                return ProviderResult(
+                    provider=self.provider_name,
+                    request=request,
+                    raw=raw,
+                    observations=[],
+                )
+            raise CollectorError(f"SerpApi error: {error}")
+
+        observations = self.normalize(raw, request, collected_at)
+        return ProviderResult(
+            provider=self.provider_name,
+            request=request,
+            raw=raw,
+            observations=observations,
+        )
+
+    @classmethod
+    def normalize(
+        cls,
+        raw: dict[str, Any],
+        request: SearchRequest,
+        collected_at: str,
+    ) -> list[PriceObservation]:
+        observations: list[PriceObservation] = []
+
+        for bucket in ("best_flights", "other_flights"):
+            for itinerary in raw.get(bucket) or []:
+                flights = itinerary.get("flights") or []
+                if not flights or itinerary.get("price") is None:
+                    continue
+
+                segments: list[Segment] = []
+                for flight in flights:
+                    departure = flight.get("departure_airport") or {}
+                    arrival = flight.get("arrival_airport") or {}
+                    flight_number = normalize_flight_number(flight.get("flight_number"))
+                    segments.append(
+                        Segment(
+                            origin=str(departure.get("id") or ""),
+                            destination=str(arrival.get("id") or ""),
+                            departure_time_local=departure.get("time"),
+                            arrival_time_local=arrival.get("time"),
+                            duration_minutes=flight.get("duration"),
+                            marketing_carrier_code=carrier_code_from_flight_number(
+                                flight_number
+                            ),
+                            marketing_carrier_name=flight.get("airline"),
+                            operating_carrier_code=None,
+                            operating_carrier_name=None,
+                            flight_number=flight_number,
+                            aircraft=flight.get("airplane"),
+                        )
+                    )
+
+                currency = (
+                    (raw.get("search_parameters") or {}).get("currency")
+                    or request.currency
+                )
+                price = Decimal(str(itinerary["price"]))
+
+                observation = PriceObservation(
+                    provider=cls.provider_name,
+                    collected_at=collected_at,
+                    target_id=request.target_id,
+                    search_origin=request.origin,
+                    search_destination=request.destination,
+                    search_departure_date=request.departure_date.isoformat(),
+                    cabin_class=request.cabin_class,
+                    currency=str(currency).upper(),
+                    total_amount=price,
+                    base_amount=None,
+                    tax_amount=None,
+                    provider_offer_id=itinerary.get("booking_token"),
+                    itinerary_signature=build_itinerary_signature(segments),
+                    total_duration_minutes=itinerary.get("total_duration"),
+                    stops=max(0, len(segments) - 1),
+                    fare_brand=None,
+                    segments=segments,
+                    source_bucket=bucket,
+                    provider_metadata={
+                        "type": itinerary.get("type"),
+                        "extensions": itinerary.get("extensions") or [],
+                        "carbon_emissions": itinerary.get("carbon_emissions"),
+                        "price_insights": raw.get("price_insights"),
+                    },
+                ).finalize()
+                observations.append(observation)
+
+        return observations
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/config.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+import os
+from pathlib import Path
+import re
+from typing import Any
+
+import yaml
+
+from flight_price_tracker.domain import SearchRequest, normalize_flight_number
+from flight_price_tracker.errors import ConfigurationError, RequestBudgetExceeded
+
+
+ALLOWED_PROVIDERS = {"serpapi", "duffel"}
+ALLOWED_CABINS = {"economy", "premium_economy", "business", "first"}
+ALLOWED_STORAGE_MODES = {"landing_zone", "postgres", "both"}
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be a boolean, got {value!r}")
+
+
+def _config_bool(value: Any, field_name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ConfigurationError(f"{field_name} must be a YAML boolean")
+
+
+def _secret_value(value_name: str, file_name: str) -> str | None:
+    value = os.getenv(value_name)
+    if value:
+        return value.strip() or None
+
+    path_value = os.getenv(file_name)
+    if not path_value:
+        return None
+    path = Path(path_value)
+    try:
+        secret = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ConfigurationError(f"Cannot read {file_name}={path}: {exc}") from exc
+    if not secret:
+        raise ConfigurationError(f"{file_name} points to an empty file: {path}")
+    return secret
+
+
+@dataclass(frozen=True)
+class Settings:
+    config_path: Path
+    output_root: Path
+    storage_mode: str
+    database_url: str | None
+    serpapi_api_key: str | None
+    duffel_access_token: str | None
+    max_requests_per_run: int
+    request_timeout_seconds: float
+    request_retries: int
+    fail_on_partial: bool
+    skip_successful_run: bool
+    require_proxy: bool
+    log_level: str
+
+    @classmethod
+    def from_env(cls, config_override: str | None = None) -> "Settings":
+        storage_mode = os.getenv("STORAGE_MODE", "landing_zone").strip().lower()
+        if storage_mode not in ALLOWED_STORAGE_MODES:
+            raise ConfigurationError(
+                f"STORAGE_MODE must be one of {sorted(ALLOWED_STORAGE_MODES)}"
+            )
+
+        settings = cls(
+            config_path=Path(
+                config_override
+                or os.getenv("TRACKING_CONFIG", "/app/config/tracked_routes.yaml")
+            ),
+            output_root=Path(os.getenv("OUTPUT_ROOT", "/app/output")),
+            storage_mode=storage_mode,
+            database_url=os.getenv("DATABASE_URL") or None,
+            serpapi_api_key=_secret_value(
+                "SERPAPI_API_KEY", "SERPAPI_API_KEY_FILE"
+            ),
+            duffel_access_token=_secret_value(
+                "DUFFEL_ACCESS_TOKEN", "DUFFEL_ACCESS_TOKEN_FILE"
+            ),
+            max_requests_per_run=int(os.getenv("MAX_REQUESTS_PER_RUN", "200")),
+            request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "45")),
+            request_retries=int(os.getenv("REQUEST_RETRIES", "3")),
+            fail_on_partial=env_bool("FAIL_ON_PARTIAL", True),
+            skip_successful_run=env_bool("SKIP_SUCCESSFUL_RUN", True),
+            require_proxy=env_bool("REQUIRE_PROXY", False),
+            log_level=os.getenv("LOG_LEVEL", "INFO"),
+        )
+
+        if settings.max_requests_per_run < 1:
+            raise ConfigurationError("MAX_REQUESTS_PER_RUN must be at least 1")
+        if settings.request_timeout_seconds <= 0:
+            raise ConfigurationError("REQUEST_TIMEOUT_SECONDS must be positive")
+        if settings.request_retries < 0:
+            raise ConfigurationError("REQUEST_RETRIES cannot be negative")
+        if settings.storage_mode in {"postgres", "both"} and not settings.database_url:
+            raise ConfigurationError(
+                "DATABASE_URL is required when STORAGE_MODE is postgres or both"
+            )
+        if settings.require_proxy:
+            https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+            http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+            if not https_proxy or not http_proxy:
+                raise ConfigurationError(
+                    "REQUIRE_PROXY=true but HTTP_PROXY/HTTPS_PROXY are not both configured"
+                )
+
+        return settings
+
+
+@dataclass(frozen=True)
+class DateSpec:
+    mode: str
+    start_date: date | None = None
+    end_date: date | None = None
+    start_days_ahead: int | None = None
+    end_days_ahead: int | None = None
+    step_days: int = 1
+    values: tuple[date, ...] = ()
+
+    def resolve(self, anchor: date) -> list[date]:
+        if self.mode == "explicit":
+            return sorted(set(self.values))
+        if self.mode == "calendar_range":
+            assert self.start_date is not None
+            assert self.end_date is not None
+            return [
+                self.start_date + timedelta(days=offset)
+                for offset in range(
+                    0,
+                    (self.end_date - self.start_date).days + 1,
+                    self.step_days,
+                )
+            ]
+        assert self.start_days_ahead is not None
+        assert self.end_days_ahead is not None
+        return [
+            anchor + timedelta(days=offset)
+            for offset in range(
+                self.start_days_ahead,
+                self.end_days_ahead + 1,
+                self.step_days,
+            )
+        ]
+
+
+@dataclass(frozen=True)
+class TrackingTarget:
+    id: str
+    enabled: bool
+    origin: str
+    destination: str
+    providers: tuple[str, ...]
+    cabin_class: str
+    currency: str
+    adults: int
+    nonstop_only: bool
+    country: str
+    language: str
+    serpapi_deep_search: bool
+    skip_past_dates: bool
+    include_airlines: tuple[str, ...]
+    flight_numbers: tuple[str, ...]
+    dates: DateSpec
+
+
+@dataclass(frozen=True)
+class TrackingConfig:
+    version: int
+    targets: tuple[TrackingTarget, ...] = field(default_factory=tuple)
+
+    @property
+    def enabled_targets(self) -> tuple[TrackingTarget, ...]:
+        return tuple(target for target in self.targets if target.enabled)
+
+    def build_search_requests(self, anchor: date) -> list[tuple[str, SearchRequest]]:
+        planned: list[tuple[str, SearchRequest]] = []
+        for target in self.enabled_targets:
+            for departure_date in target.dates.resolve(anchor):
+                if target.skip_past_dates and departure_date < anchor:
+                    continue
+                request = SearchRequest(
+                    target_id=target.id,
+                    origin=target.origin,
+                    destination=target.destination,
+                    departure_date=departure_date,
+                    cabin_class=target.cabin_class,
+                    currency=target.currency,
+                    adults=target.adults,
+                    nonstop_only=target.nonstop_only,
+                    country=target.country,
+                    language=target.language,
+                    include_airlines=target.include_airlines,
+                    flight_numbers=target.flight_numbers,
+                    serpapi_deep_search=target.serpapi_deep_search,
+                )
+                for provider in target.providers:
+                    planned.append((provider, request))
+        return planned
+
+    def enforce_request_budget(self, anchor: date, limit: int) -> int:
+        count = len(self.build_search_requests(anchor))
+        if count > limit:
+            raise RequestBudgetExceeded(
+                f"Planned {count} provider requests, exceeding MAX_REQUESTS_PER_RUN={limit}. "
+                "Reduce enabled targets/date density/providers or raise the limit deliberately."
+            )
+        return count
+
+
+def _iata(value: Any, field_name: str) -> str:
+    result = str(value or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", result):
+        raise ConfigurationError(f"{field_name} must be a 3-letter IATA airport code")
+    return result
+
+
+def _airline_codes(values: Any) -> tuple[str, ...]:
+    result = []
+    for value in values or []:
+        code = str(value).strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2}", code):
+            raise ConfigurationError(f"Invalid airline IATA code: {value!r}")
+        result.append(code)
+    return tuple(dict.fromkeys(result))
+
+
+def _date_spec(raw: dict[str, Any]) -> DateSpec:
+    mode = str(raw.get("mode", "")).strip().lower()
+    if mode == "explicit":
+        values = raw.get("values") or []
+        if not values:
+            raise ConfigurationError("Explicit dates require at least one value")
+        try:
+            parsed = tuple(date.fromisoformat(str(value)) for value in values)
+        except ValueError as exc:
+            raise ConfigurationError(f"Invalid explicit date: {exc}") from exc
+        return DateSpec(mode="explicit", values=parsed)
+
+    if mode == "calendar_range":
+        try:
+            start_date = date.fromisoformat(str(raw["start_date"]))
+            end_date = date.fromisoformat(str(raw["end_date"]))
+            step = int(raw.get("step_days", 1))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigurationError(
+                "Calendar ranges require ISO start_date/end_date and an integer step_days"
+            ) from exc
+        if end_date < start_date or step < 1:
+            raise ConfigurationError(
+                "Calendar ranges require start_date <= end_date and step_days >= 1"
+            )
+        return DateSpec(
+            mode="calendar_range",
+            start_date=start_date,
+            end_date=end_date,
+            step_days=step,
+        )
+
+    if mode == "rolling":
+        try:
+            start = int(raw["start_days_ahead"])
+            end = int(raw["end_days_ahead"])
+            step = int(raw.get("step_days", 1))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigurationError(
+                "Rolling dates require integer start_days_ahead/end_days_ahead/step_days"
+            ) from exc
+        if start < 0 or end < start or step < 1:
+            raise ConfigurationError(
+                "Rolling dates require 0 <= start_days_ahead <= end_days_ahead and step_days >= 1"
+            )
+        return DateSpec(
+            mode="rolling",
+            start_days_ahead=start,
+            end_days_ahead=end,
+            step_days=step,
+        )
+
+    raise ConfigurationError(
+        "dates.mode must be calendar_range, explicit, or rolling"
+    )
+
+
+def load_tracking_config(path: Path) -> TrackingConfig:
+    if not path.exists():
+        raise ConfigurationError(f"Tracking config does not exist: {path}")
+
+    raw = yaml.safe_load(path.read_text()) or {}
+    if raw.get("version") != 1:
+        raise ConfigurationError("Only tracking config version 1 is supported")
+
+    defaults = raw.get("defaults") or {}
+    targets_raw = raw.get("targets") or []
+    if not isinstance(targets_raw, list):
+        raise ConfigurationError("targets must be a list")
+
+    targets: list[TrackingTarget] = []
+    seen_ids: set[str] = set()
+
+    for item in targets_raw:
+        merged = {**defaults, **(item or {})}
+        target_id = str(merged.get("id", "")).strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,62}", target_id):
+            raise ConfigurationError(
+                f"Invalid target id {target_id!r}; use lowercase letters, numbers, _ or -"
+            )
+        if target_id in seen_ids:
+            raise ConfigurationError(f"Duplicate target id: {target_id}")
+        seen_ids.add(target_id)
+
+        providers = tuple(
+            dict.fromkeys(str(p).strip().lower() for p in merged.get("providers", []))
+        )
+        if not providers or not set(providers).issubset(ALLOWED_PROVIDERS):
+            raise ConfigurationError(
+                f"{target_id}: providers must be a non-empty subset of {sorted(ALLOWED_PROVIDERS)}"
+            )
+
+        cabin_class = str(merged.get("cabin_class", "economy")).strip().lower()
+        if cabin_class not in ALLOWED_CABINS:
+            raise ConfigurationError(
+                f"{target_id}: cabin_class must be one of {sorted(ALLOWED_CABINS)}"
+            )
+
+        currency = str(merged.get("currency", "CAD")).strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ConfigurationError(f"{target_id}: currency must be a 3-letter code")
+
+        adults = int(merged.get("adults", 1))
+        if adults < 1 or adults > 9:
+            raise ConfigurationError(f"{target_id}: adults must be between 1 and 9")
+
+        flight_numbers = tuple(
+            dict.fromkeys(
+                value
+                for raw_value in merged.get("flight_numbers", [])
+                if (value := normalize_flight_number(str(raw_value)))
+            )
+        )
+
+        targets.append(
+            TrackingTarget(
+                id=target_id,
+                enabled=_config_bool(
+                    merged.get("enabled"), f"{target_id}.enabled", True
+                ),
+                origin=_iata(merged.get("origin"), f"{target_id}.origin"),
+                destination=_iata(merged.get("destination"), f"{target_id}.destination"),
+                providers=providers,
+                cabin_class=cabin_class,
+                currency=currency,
+                adults=adults,
+                nonstop_only=_config_bool(
+                    merged.get("nonstop_only"),
+                    f"{target_id}.nonstop_only",
+                    True,
+                ),
+                country=str(merged.get("country", "ca")).strip().lower(),
+                language=str(merged.get("language", "en")).strip().lower(),
+                serpapi_deep_search=_config_bool(
+                    merged.get("serpapi_deep_search"),
+                    f"{target_id}.serpapi_deep_search",
+                    False,
+                ),
+                skip_past_dates=_config_bool(
+                    merged.get("skip_past_dates"),
+                    f"{target_id}.skip_past_dates",
+                    True,
+                ),
+                include_airlines=_airline_codes(merged.get("include_airlines")),
+                flight_numbers=flight_numbers,
+                dates=_date_spec(merged.get("dates") or {}),
+            )
+        )
+
+    if not targets:
+        raise ConfigurationError("At least one target must be configured")
+
+    return TrackingConfig(version=1, targets=tuple(targets))
+
+
+def validate_provider_credentials(config: TrackingConfig, settings: Settings) -> None:
+    providers = {
+        provider
+        for target in config.enabled_targets
+        for provider in target.providers
+    }
+    if "serpapi" in providers and not settings.serpapi_api_key:
+        raise ConfigurationError(
+            "SERPAPI_API_KEY is required because an enabled target uses serpapi"
+        )
+    if "duffel" in providers and not settings.duffel_access_token:
+        raise ConfigurationError(
+            "DUFFEL_ACCESS_TOKEN is required because an enabled target uses duffel"
+        )
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/determinism.py
+================================================================================
+
+from __future__ import annotations
+from dataclasses import asdict
+from datetime import date
+from hashlib import sha256
+import json
+from typing import Any
+from flight_price_tracker.domain import SearchRequest
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+def fingerprint(value: Any) -> str:
+    return sha256(canonical_json_bytes(value)).hexdigest()
+
+def request_definition(provider: str, request: SearchRequest) -> dict[str, Any]:
+    d = asdict(request)
+    d['departure_date'] = request.departure_date.isoformat()
+    d['include_airlines'] = list(request.include_airlines)
+    d['flight_numbers'] = list(request.flight_numbers)
+    return {'provider': provider, **d}
+
+def request_key(definition: dict[str, Any]) -> str:
+    return fingerprint(definition)
+
+def canonical_plan(planned):
+    rows=[request_definition(p,r) for p,r in planned]
+    rows.sort(key=lambda x: canonical_json_bytes(x))
+    return rows
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/domain.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import date
+from decimal import Decimal
+from hashlib import sha256
+import json
+import re
+from typing import Any
+
+
+def normalize_flight_number(value: str | None) -> str | None:
+    if not value:
+        return None
+    return re.sub(r"\s+", "", value).upper()
+
+
+def carrier_code_from_flight_number(value: str | None) -> str | None:
+    normalized = normalize_flight_number(value)
+    if not normalized:
+        return None
+    match = re.match(r"^([A-Z0-9]{2})(?=\d)", normalized)
+    return match.group(1) if match else None
+
+
+@dataclass(frozen=True)
+class PassengerSpec:
+    adults: int = 1
+
+
+@dataclass(frozen=True)
+class SearchRequest:
+    target_id: str
+    origin: str
+    destination: str
+    departure_date: date
+    cabin_class: str
+    currency: str
+    adults: int
+    nonstop_only: bool
+    country: str
+    language: str
+    include_airlines: tuple[str, ...] = ()
+    flight_numbers: tuple[str, ...] = ()
+    serpapi_deep_search: bool = False
+
+
+@dataclass(frozen=True)
+class Segment:
+    origin: str
+    destination: str
+    departure_time_local: str | None
+    arrival_time_local: str | None
+    duration_minutes: int | None
+    marketing_carrier_code: str | None
+    marketing_carrier_name: str | None
+    operating_carrier_code: str | None
+    operating_carrier_name: str | None
+    flight_number: str | None
+    aircraft: str | None = None
+
+
+@dataclass
+class PriceObservation:
+    provider: str
+    collected_at: str
+    target_id: str
+    search_origin: str
+    search_destination: str
+    search_departure_date: str
+    cabin_class: str
+    currency: str
+    total_amount: Decimal
+    base_amount: Decimal | None
+    tax_amount: Decimal | None
+    provider_offer_id: str | None
+    itinerary_signature: str
+    total_duration_minutes: int | None
+    stops: int
+    fare_brand: str | None
+    segments: list[Segment]
+    source_bucket: str | None = None
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+    record_key: str = ""
+
+    def finalize(self) -> "PriceObservation":
+        if not self.record_key:
+            identity = {
+                "provider": self.provider,
+                "target_id": self.target_id,
+                "search_departure_date": self.search_departure_date,
+                "itinerary_signature": self.itinerary_signature,
+                "cabin_class": self.cabin_class,
+                "currency": self.currency,
+                "total_amount": str(self.total_amount),
+                "fare_brand": self.fare_brand,
+                "provider_offer_id": self.provider_offer_id,
+            }
+            self.record_key = sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        return self
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "PriceObservation":
+        data = dict(payload)
+        data["total_amount"] = Decimal(data["total_amount"])
+        data["base_amount"] = None if data.get("base_amount") is None else Decimal(data["base_amount"])
+        data["tax_amount"] = None if data.get("tax_amount") is None else Decimal(data["tax_amount"])
+        data["segments"] = [Segment(**segment) for segment in data.get("segments", [])]
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["total_amount"] = str(self.total_amount)
+        payload["base_amount"] = None if self.base_amount is None else str(self.base_amount)
+        payload["tax_amount"] = None if self.tax_amount is None else str(self.tax_amount)
+        return payload
+
+
+def build_itinerary_signature(segments: list[Segment]) -> str:
+    parts = []
+    for segment in segments:
+        parts.append(
+            "|".join(
+                [
+                    segment.origin,
+                    segment.destination,
+                    normalize_flight_number(segment.flight_number) or "",
+                    segment.departure_time_local or "",
+                    segment.arrival_time_local or "",
+                ]
+            )
+        )
+    return sha256("||".join(parts).encode()).hexdigest()
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/errors.py
+================================================================================
+
+class FlightPriceTrackerError(Exception):
+    """Base application error."""
+
+
+class ConfigurationError(FlightPriceTrackerError):
+    """Invalid application or tracking configuration."""
+
+
+class RequestBudgetExceeded(ConfigurationError):
+    """The planned provider request count exceeds the configured safety limit."""
+
+
+class CollectorError(FlightPriceTrackerError):
+    """A provider request failed or returned an unusable response."""
+
+
+class StorageError(FlightPriceTrackerError):
+    """Durable output could not be written."""
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/filtering.py
+================================================================================
+
+from __future__ import annotations
+
+from flight_price_tracker.domain import PriceObservation, SearchRequest, normalize_flight_number
+
+
+def observation_matches_request(
+    observation: PriceObservation,
+    request: SearchRequest,
+) -> bool:
+    if (
+        observation.target_id != request.target_id
+        or observation.search_origin != request.origin
+        or observation.search_destination != request.destination
+        or observation.search_departure_date != request.departure_date.isoformat()
+        or observation.cabin_class != request.cabin_class
+    ):
+        return False
+
+    if not observation.segments:
+        return False
+    if (
+        observation.segments[0].origin != request.origin
+        or observation.segments[-1].destination != request.destination
+    ):
+        return False
+
+    if request.nonstop_only and observation.stops != 0:
+        return False
+    if request.nonstop_only and len(observation.segments) != 1:
+        return False
+
+    if request.include_airlines:
+        allowed = set(request.include_airlines)
+        observed_codes = {
+            segment.marketing_carrier_code
+            for segment in observation.segments
+            if segment.marketing_carrier_code
+        }
+        if not observed_codes or not observed_codes.issubset(allowed):
+            return False
+
+    if request.flight_numbers:
+        allowed_numbers = {
+            normalize_flight_number(value) for value in request.flight_numbers
+        }
+        observed_numbers = {
+            normalize_flight_number(segment.flight_number)
+            for segment in observation.segments
+            if segment.flight_number
+        }
+        if not observed_numbers.intersection(allowed_numbers):
+            return False
+
+    return True
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/http_client.py
+================================================================================
+
+from __future__ import annotations
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+def build_session(retries: int) -> requests.Session:
+    retry = Retry(
+        total=retries,
+        connect=retries,
+        read=retries,
+        status=retries,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        # Retrying Duffel's POST automatically could create duplicate offer
+        # requests after an ambiguous read timeout. SerpApi GETs are safe to
+        # retry; Duffel failures are checkpointed and retried by Airflow.
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    # requests automatically honors HTTP_PROXY / HTTPS_PROXY / NO_PROXY.
+    return session
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/logging_config.py
+================================================================================
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+from datetime import datetime, timezone
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key in ("run_id", "target_id", "provider", "departure_date"):
+            value = getattr(record, key, None)
+            if value is not None:
+                payload[key] = value
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def configure_logging(level: str = "INFO") -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level.upper())
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/run_context.py
+================================================================================
+
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+import os
+
+
+def parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+@dataclass(frozen=True)
+class RunContext:
+    run_id: str
+    logical_at: datetime
+    anchor_date: date
+    attempt_started_at: datetime
+
+    @classmethod
+    def resolve(cls, *, cli_run_id=None, cli_logical_at=None, cli_anchor_date=None, environ=None, now=None):
+        env = os.environ if environ is None else environ
+        initial = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        logical = parse_utc(cli_logical_at or env.get('LOGICAL_AT')) if (cli_logical_at or env.get('LOGICAL_AT')) else initial
+        anchor = date.fromisoformat(cli_anchor_date or env.get('ANCHOR_DATE')) if (cli_anchor_date or env.get('ANCHOR_DATE')) else logical.date()
+        run_id = cli_run_id or env.get('RUN_ID') or logical.strftime('%Y%m%dT%H%M%S.%fZ')
+        return cls(run_id=run_id, logical_at=logical, anchor_date=anchor, attempt_started_at=initial)
+
+    def stable_dict(self):
+        return {'run_id': self.run_id, 'logical_at': iso_utc(self.logical_at), 'anchor_date': self.anchor_date.isoformat()}
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/service.py
+================================================================================
+
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+from hashlib import sha256
+import logging
+from typing import Any
+
+from flight_price_tracker import __version__
+from flight_price_tracker.collectors import DuffelCollector, SerpApiCollector
+from flight_price_tracker.config import (
+    Settings,
+    TrackingConfig,
+    validate_provider_credentials,
+)
+from flight_price_tracker.determinism import (
+    canonical_plan,
+    fingerprint,
+    request_key,
+)
+from flight_price_tracker.domain import SearchRequest
+from flight_price_tracker.filtering import observation_matches_request
+from flight_price_tracker.http_client import build_session
+from flight_price_tracker.run_context import RunContext, iso_utc
+from flight_price_tracker.storage import LandingZone
+
+
+logger = logging.getLogger(__name__)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def make_collectors(settings: Settings) -> dict[str, Any]:
+    session = build_session(settings.request_retries)
+    collectors: dict[str, Any] = {}
+    if settings.serpapi_api_key:
+        collectors["serpapi"] = SerpApiCollector(
+            settings.serpapi_api_key,
+            session,
+            settings.request_timeout_seconds,
+        )
+    if settings.duffel_access_token:
+        collectors["duffel"] = DuffelCollector(
+            settings.duffel_access_token,
+            session,
+            settings.request_timeout_seconds,
+        )
+    return collectors
+
+
+def resolved_plan(
+    config: TrackingConfig, settings: Settings, anchor: date
+) -> list[dict[str, Any]]:
+    planned = config.build_search_requests(anchor)
+    config.enforce_request_budget(anchor, settings.max_requests_per_run)
+    return canonical_plan(planned)
+
+
+def plan_collection(
+    config: TrackingConfig, settings: Settings, anchor: date
+) -> dict[str, Any]:
+    rows = resolved_plan(config, settings, anchor)
+    return {
+        "anchor_date": anchor.isoformat(),
+        "request_count": len(rows),
+        "max_requests_per_run": settings.max_requests_per_run,
+        "plan_sha256": fingerprint(rows),
+        "requests": rows,
+    }
+
+
+def _search_request(definition: dict[str, Any]) -> tuple[str, SearchRequest]:
+    values = dict(definition)
+    provider = values.pop("provider")
+    values["departure_date"] = date.fromisoformat(values["departure_date"])
+    values["include_airlines"] = tuple(values["include_airlines"])
+    values["flight_numbers"] = tuple(values["flight_numbers"])
+    return provider, SearchRequest(**values)
+
+
+def collect(
+    config: TrackingConfig, settings: Settings, context: RunContext
+) -> dict[str, Any]:
+    plan = resolved_plan(config, settings, context.anchor_date)
+    landing = LandingZone(settings.output_root, context)
+    config_sha256 = sha256(settings.config_path.read_bytes()).hexdigest()
+    definition = {
+        "schema_version": 2,
+        **context.stable_dict(),
+        "application_version": __version__,
+        "tracking_config_sha256": config_sha256,
+        "resolved_plan_sha256": fingerprint(plan),
+        "requests": [
+            {**row, "request_key": request_key(row)} for row in plan
+        ],
+    }
+    if landing.already_successful():
+        definition_sha256 = landing.ensure_definition(definition)
+        if settings.skip_successful_run:
+            return {
+                "run_id": context.run_id,
+                "status": "skipped_already_successful",
+                "run_dir": str(landing.run_dir),
+                "run_definition_sha256": definition_sha256,
+            }
+        raise ValueError(
+            "The run is already complete and immutable; "
+            "set a different RUN_ID to collect another observation"
+        )
+
+    validate_provider_credentials(config, settings)
+    definition_sha256 = landing.ensure_definition(definition)
+    collectors = make_collectors(settings)
+    observations = []
+    failures = []
+    reused = 0
+    executed = 0
+
+    for item in definition["requests"]:
+        key = item["request_key"]
+        request_definition = {
+            name: value for name, value in item.items() if name != "request_key"
+        }
+        if landing.checkpoint_complete(key, request_definition):
+            observations.extend(
+                landing.read_checkpoint_observations(key, request_definition)
+            )
+            reused += 1
+            continue
+
+        provider, request = _search_request(request_definition)
+        fetched_at = iso_utc(utc_now())
+        try:
+            result = collectors[provider].collect(request, fetched_at)
+            accepted = [
+                observation
+                for observation in result.observations
+                if observation_matches_request(observation, request)
+            ]
+            landing.write_checkpoint(
+                key,
+                request_definition,
+                result.raw,
+                accepted,
+                {
+                    "request_key": key,
+                    "logical_at": iso_utc(context.logical_at),
+                    "provider_fetched_at": fetched_at,
+                    "attempt_started_at": iso_utc(context.attempt_started_at),
+                    "provider_observation_count": len(result.observations),
+                    "accepted_observation_count": len(accepted),
+                },
+            )
+            observations.extend(accepted)
+            executed += 1
+        except Exception as exc:  # preserve successful checkpoints for retry
+            logger.exception("Collection request %s failed", key)
+            failures.append(
+                {
+                    "request_key": key,
+                    "provider": provider,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+
+    normalized_paths = landing.write_observations(observations)
+    if not failures:
+        status = "success"
+    elif observations:
+        status = "partial_failure"
+    else:
+        status = "failed"
+
+    manifest = {
+        "schema_version": 3,
+        "run_id": context.run_id,
+        "logical_at": iso_utc(context.logical_at),
+        "anchor_date": context.anchor_date.isoformat(),
+        "attempt_started_at": iso_utc(context.attempt_started_at),
+        "run_definition_sha256": definition_sha256,
+        "status": status,
+        "planned_requests": len(plan),
+        "completed_requests": len(plan) - len(failures),
+        "reused_requests": reused,
+        "executed_requests": executed,
+        "failed_requests": len(failures),
+        "observation_count": len(observations),
+        "storage_mode": settings.storage_mode,
+        "failures": failures,
+        "files": [landing.file_entry(path) for path in normalized_paths],
+    }
+
+    if settings.storage_mode in {"postgres", "both"}:
+        from flight_price_tracker.storage.postgres import PostgresSink
+
+        postgres = PostgresSink(settings.database_url or "")
+        postgres.ensure_schema()
+        postgres.write_observations(context.run_id, observations)
+        postgres.write_run_manifest(
+            context.run_id,
+            {**manifest, "collected_at": iso_utc(context.logical_at)},
+        )
+
+    manifest_path = landing.write_manifest(manifest)
+    should_fail = bool(failures) and (
+        settings.fail_on_partial or not observations
+    )
+    if should_fail:
+        landing.mark_failed()
+    else:
+        landing.mark_success()
+
+    return {
+        **manifest,
+        "manifest_path": str(manifest_path),
+        "run_dir": str(landing.run_dir),
+        "exit_success": not should_fail,
+    }
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/storage/__init__.py
+================================================================================
+
+from flight_price_tracker.storage.landing_zone import LandingZone
+
+__all__ = ["LandingZone"]
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/storage/landing_zone.py
+================================================================================
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+from typing import Any, Iterable
+
+from flight_price_tracker.determinism import canonical_json_bytes
+from flight_price_tracker.domain import PriceObservation
+from flight_price_tracker.errors import StorageError
+from flight_price_tracker.run_context import RunContext
+
+
+def safe_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    if not cleaned or cleaned in {".", ".."}:
+        raise StorageError(f"Unsafe path component: {value!r}")
+    return cleaned
+
+
+def hive_component(key: str, value: str) -> str:
+    return f"{key}={safe_component(value)}"
+
+
+def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass
+class LandingZone:
+    output_root: Path
+    context: RunContext
+
+    def __post_init__(self) -> None:
+        collection_date = self.context.logical_at.date().isoformat()
+        self.run_dir = (
+            self.output_root
+            / hive_component("collection_date", collection_date)
+            / hive_component("run_id", self.context.run_id)
+        )
+
+    @property
+    def success_path(self) -> Path:
+        return self.run_dir / "_SUCCESS"
+
+    @property
+    def definition_path(self) -> Path:
+        return self.run_dir / "run_definition.json"
+
+    def already_successful(self) -> bool:
+        return self.success_path.exists()
+
+    def assert_mutable(self) -> None:
+        if self.success_path.exists():
+            raise StorageError(f"Completed run is immutable: {self.run_dir}")
+
+    def ensure_definition(self, definition: dict[str, Any]) -> str:
+        payload = canonical_json_bytes(definition)
+        digest = sha256(payload).hexdigest()
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        if self.definition_path.exists():
+            if self.definition_path.read_bytes() != payload:
+                raise StorageError(
+                    "Existing run_definition.json differs for the same logical run"
+                )
+        else:
+            self.assert_mutable()
+            atomic_write_bytes(self.definition_path, payload)
+        return digest
+
+    def request_dir(self, key: str, definition: dict[str, Any]) -> Path:
+        return (
+            self.run_dir
+            / "raw"
+            / hive_component("provider", str(definition["provider"]))
+            / hive_component("origin", str(definition["origin"]))
+            / hive_component("destination", str(definition["destination"]))
+            / hive_component("departure_date", str(definition["departure_date"]))
+            / hive_component("request_key", key)
+        )
+
+    def checkpoint_complete(
+        self, key: str, definition: dict[str, Any]
+    ) -> bool:
+        directory = self.request_dir(key, definition)
+        required = [
+            directory / "request.json",
+            directory / "response.json",
+            directory / "observations.ndjson",
+            directory / "metadata.json",
+            directory / "_SUCCESS",
+        ]
+        if not all(path.exists() for path in required):
+            return False
+        try:
+            if json.loads((directory / "request.json").read_text()) != definition:
+                return False
+            json.loads((directory / "response.json").read_text())
+            json.loads((directory / "metadata.json").read_text())
+            self.read_checkpoint_observations(key, definition)
+            return True
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+
+    def write_checkpoint(
+        self,
+        key: str,
+        definition: dict[str, Any],
+        raw: dict[str, Any],
+        observations: Iterable[PriceObservation],
+        metadata: dict[str, Any],
+    ) -> None:
+        self.assert_mutable()
+        directory = self.request_dir(key, definition)
+        directory.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(directory / "request.json", canonical_json_bytes(definition))
+        atomic_write_bytes(
+            directory / "response.json",
+            json.dumps(raw, ensure_ascii=False, sort_keys=True, indent=2).encode(),
+        )
+        lines = [
+            json.dumps(
+                observation.to_dict(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for observation in observations
+        ]
+        atomic_write_bytes(
+            directory / "observations.ndjson",
+            (("\n".join(lines) + "\n") if lines else "").encode(),
+        )
+        atomic_write_bytes(directory / "metadata.json", canonical_json_bytes(metadata))
+        atomic_write_bytes(directory / "_SUCCESS", b"")
+
+    def read_checkpoint_observations(
+        self, key: str, definition: dict[str, Any]
+    ) -> list[PriceObservation]:
+        path = self.request_dir(key, definition) / "observations.ndjson"
+        return [
+            PriceObservation.from_dict(json.loads(line))
+            for line in path.read_text().splitlines()
+            if line.strip()
+        ]
+
+    def write_observations(
+        self, observations: Iterable[PriceObservation]
+    ) -> list[Path]:
+        self.assert_mutable()
+        partitions: dict[tuple[str, str, str, str], list[dict[str, Any]]] = (
+            defaultdict(list)
+        )
+        for observation in observations:
+            key = (
+                observation.provider,
+                observation.search_origin,
+                observation.search_destination,
+                observation.search_departure_date,
+            )
+            partitions[key].append(observation.to_dict())
+
+        paths: list[Path] = []
+        for (provider, origin, destination, departure_date), records in sorted(
+            partitions.items()
+        ):
+            path = (
+                self.run_dir
+                / "normalized"
+                / hive_component("provider", provider)
+                / hive_component("origin", origin)
+                / hive_component("destination", destination)
+                / hive_component("departure_date", departure_date)
+                / "observations.ndjson"
+            )
+            ordered = sorted(records, key=canonical_json_bytes)
+            lines = [
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for record in ordered
+            ]
+            atomic_write_bytes(path, ("\n".join(lines) + "\n").encode())
+            paths.append(path)
+        return paths
+
+    def write_manifest(self, manifest: dict[str, Any]) -> Path:
+        self.assert_mutable()
+        path = self.run_dir / "manifest.json"
+        atomic_write_bytes(
+            path,
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode(),
+        )
+        return path
+
+    def mark_success(self) -> None:
+        self.assert_mutable()
+        (self.run_dir / "_FAILED").unlink(missing_ok=True)
+        atomic_write_bytes(self.success_path, b"")
+
+    def mark_failed(self) -> None:
+        self.assert_mutable()
+        atomic_write_bytes(self.run_dir / "_FAILED", b"")
+
+    def file_entry(self, path: Path) -> dict[str, Any]:
+        return {
+            "path": str(path.relative_to(self.run_dir)),
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/storage/postgres.py
+================================================================================
+
+from __future__ import annotations
+
+import json
+from importlib.resources import files
+from typing import Any
+
+import psycopg
+from psycopg.types.json import Jsonb
+
+from flight_price_tracker.domain import PriceObservation
+
+
+class PostgresSink:
+    def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
+
+    def ensure_schema(self) -> None:
+        schema = (
+            files("flight_price_tracker.storage")
+            .joinpath("schema.sql")
+            .read_text(encoding="utf-8")
+        )
+        with psycopg.connect(self.database_url) as connection:
+            connection.execute(schema)
+
+    def write_observations(
+        self,
+        run_id: str,
+        observations: list[PriceObservation],
+    ) -> int:
+        if not observations:
+            return 0
+
+        sql = """
+        INSERT INTO flight_price_observations (
+            run_id,
+            record_key,
+            provider,
+            collected_at,
+            target_id,
+            search_origin,
+            search_destination,
+            search_departure_date,
+            cabin_class,
+            currency,
+            total_amount,
+            base_amount,
+            tax_amount,
+            provider_offer_id,
+            itinerary_signature,
+            total_duration_minutes,
+            stops,
+            fare_brand,
+            segments,
+            source_bucket,
+            provider_metadata
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        ON CONFLICT (run_id, record_key) DO UPDATE SET
+            collected_at = EXCLUDED.collected_at,
+            total_amount = EXCLUDED.total_amount,
+            base_amount = EXCLUDED.base_amount,
+            tax_amount = EXCLUDED.tax_amount,
+            provider_metadata = EXCLUDED.provider_metadata
+        """
+
+        rows: list[tuple[Any, ...]] = []
+        for observation in observations:
+            payload = observation.to_dict()
+            rows.append(
+                (
+                    run_id,
+                    observation.record_key,
+                    observation.provider,
+                    observation.collected_at,
+                    observation.target_id,
+                    observation.search_origin,
+                    observation.search_destination,
+                    observation.search_departure_date,
+                    observation.cabin_class,
+                    observation.currency,
+                    observation.total_amount,
+                    observation.base_amount,
+                    observation.tax_amount,
+                    observation.provider_offer_id,
+                    observation.itinerary_signature,
+                    observation.total_duration_minutes,
+                    observation.stops,
+                    observation.fare_brand,
+                    Jsonb(payload["segments"]),
+                    observation.source_bucket,
+                    Jsonb(observation.provider_metadata),
+                )
+            )
+
+        with psycopg.connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.executemany(sql, rows)
+        return len(rows)
+
+    def write_run_manifest(self, run_id: str, manifest: dict[str, Any]) -> None:
+        sql = """
+        INSERT INTO flight_price_collection_runs (
+            run_id, collected_at, status, planned_requests, completed_requests,
+            observation_count, manifest
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (run_id) DO UPDATE SET
+            collected_at = EXCLUDED.collected_at,
+            status = EXCLUDED.status,
+            planned_requests = EXCLUDED.planned_requests,
+            completed_requests = EXCLUDED.completed_requests,
+            observation_count = EXCLUDED.observation_count,
+            manifest = EXCLUDED.manifest
+        """
+        with psycopg.connect(self.database_url) as connection:
+            connection.execute(
+                sql,
+                (
+                    run_id,
+                    manifest["collected_at"],
+                    manifest["status"],
+                    manifest["planned_requests"],
+                    manifest["completed_requests"],
+                    manifest["observation_count"],
+                    Jsonb(manifest),
+                ),
+            )
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/src/flight_price_tracker/storage/schema.sql
+================================================================================
+
+CREATE TABLE IF NOT EXISTS flight_price_collection_runs (
+    run_id TEXT PRIMARY KEY,
+    collected_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL,
+    planned_requests INTEGER NOT NULL,
+    completed_requests INTEGER NOT NULL,
+    observation_count INTEGER NOT NULL,
+    manifest JSONB NOT NULL,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS flight_price_observations (
+    id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    record_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    collected_at TIMESTAMPTZ NOT NULL,
+    target_id TEXT NOT NULL,
+    search_origin CHAR(3) NOT NULL,
+    search_destination CHAR(3) NOT NULL,
+    search_departure_date DATE NOT NULL,
+    cabin_class TEXT NOT NULL,
+    currency CHAR(3) NOT NULL,
+    total_amount NUMERIC(12, 2) NOT NULL,
+    base_amount NUMERIC(12, 2),
+    tax_amount NUMERIC(12, 2),
+    provider_offer_id TEXT,
+    itinerary_signature TEXT NOT NULL,
+    total_duration_minutes INTEGER,
+    stops INTEGER NOT NULL,
+    fare_brand TEXT,
+    segments JSONB NOT NULL,
+    source_bucket TEXT,
+    provider_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_flight_price_run_record UNIQUE (run_id, record_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_flight_price_observations_lookup
+    ON flight_price_observations (
+        target_id,
+        search_departure_date,
+        collected_at
+    );
+
+CREATE INDEX IF NOT EXISTS idx_flight_price_observations_itinerary
+    ON flight_price_observations (
+        itinerary_signature,
+        collected_at
+    );
+
+CREATE INDEX IF NOT EXISTS idx_flight_price_observations_provider
+    ON flight_price_observations (
+        provider,
+        collected_at
+    );
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/fixtures/duffel_response.json
+================================================================================
+
+{
+  "data": {
+    "id": "orq_example",
+    "live_mode": false,
+    "offers": [
+      {
+        "id": "off_example",
+        "live_mode": false,
+        "expires_at": "2026-08-28T17:30:00Z",
+        "total_currency": "CAD",
+        "total_amount": "319.40",
+        "base_amount": "280.00",
+        "tax_amount": "39.40",
+        "owner": {
+          "iata_code": "AC",
+          "name": "Air Canada"
+        },
+        "slices": [
+          {
+            "segments": [
+              {
+                "origin": {
+                  "iata_code": "YYZ"
+                },
+                "destination": {
+                  "iata_code": "YVR"
+                },
+                "departing_at": "2026-11-20T08:00:00",
+                "arriving_at": "2026-11-20T10:10:00",
+                "duration": "PT5H10M",
+                "marketing_carrier": {
+                  "iata_code": "AC",
+                  "name": "Air Canada"
+                },
+                "operating_carrier": {
+                  "iata_code": "AC",
+                  "name": "Air Canada"
+                },
+                "marketing_carrier_flight_number": "103",
+                "aircraft": {
+                  "name": "Boeing 737 MAX 8"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/fixtures/serpapi_response.json
+================================================================================
+
+{
+  "search_parameters": {
+    "engine": "google_flights",
+    "departure_id": "YYZ",
+    "arrival_id": "YVR",
+    "outbound_date": "2026-11-20",
+    "travel_class": 1,
+    "currency": "CAD"
+  },
+  "best_flights": [
+    {
+      "flights": [
+        {
+          "departure_airport": {
+            "name": "Toronto Pearson International Airport",
+            "id": "YYZ",
+            "time": "2026-11-20 08:00"
+          },
+          "arrival_airport": {
+            "name": "Vancouver International Airport",
+            "id": "YVR",
+            "time": "2026-11-20 10:10"
+          },
+          "duration": 310,
+          "airplane": "Boeing 737 MAX 8",
+          "airline": "Air Canada",
+          "travel_class": "Economy",
+          "flight_number": "AC 103"
+        }
+      ],
+      "total_duration": 310,
+      "price": 312,
+      "type": "One way",
+      "booking_token": "example-booking-token"
+    }
+  ],
+  "other_flights": [],
+  "price_insights": {
+    "lowest_price": 312,
+    "price_level": "typical"
+  }
+}
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_airflow_runtime.py
+================================================================================
+
+from pathlib import Path
+
+from orchestration.airflow.flight_tracker_task import (
+    FlightTrackerSettings,
+    airflow_logical_env,
+    kubernetes_pod_template,
+)
+
+def pod(place='any'):
+    settings = FlightTrackerSettings.from_env(
+        {
+            'FLIGHT_PRICE_TRACKER_IMAGE': 'img@sha256:x',
+            'FLIGHT_KILLSWITCH_IMAGE': 'kill@sha256:y',
+            'FLIGHT_KUBERNETES_PLACEMENT': place,
+        }
+    )
+    return kubernetes_pod_template(settings)
+def test_kpo_contract():
+    p=pod(); s=p['spec']; assert s['automountServiceAccountToken'] is False and s['serviceAccountName']=='registry-runner'
+    assert [x['name'] for x in s['initContainers']]==['verify-output-access','configure-proton-egress']; assert s['containers'][0]['name']=='base'
+    pre=s['initContainers'][0]; assert pre['securityContext']['runAsUser']==1000 and any(m['mountPath']=='/app/output' for m in pre['volumeMounts'])
+    eg=s['initContainers'][1]; assert eg['securityContext']['capabilities']=={'drop':['ALL'],'add':['NET_ADMIN']}; cmd=eg['command'][-1]; assert 'iptables -F OUTPUT' in cmd and 'iptables -P OUTPUT DROP' in cmd and '--dport 53' in cmd and '--dport 8888' in cmd
+    app=s['containers'][0]; sc=app['securityContext']; assert sc['runAsNonRoot'] and sc['readOnlyRootFilesystem'] and sc['capabilities']['drop']==['ALL'] and sc['seccompProfile']['type']=='RuntimeDefault'
+    assert all(k in app['resources']['requests'] and k in app['resources']['limits'] for k in ['cpu','memory','ephemeral-storage'])
+    vols={v['name']:v for v in s['volumes']}; assert vols['output']['persistentVolumeClaim']['claimName']=='tracker-output'; assert vols['tmp']['emptyDir']['sizeLimit']=='64Mi' and vols['run']['emptyDir']['sizeLimit']=='1Mi'
+    assert vols['credentials']['secret']['secretName']=='flight-price-tracker-secrets'
+def test_placement_modes():
+    assert 'tolerations' in pod('any')['spec']; assert 'DoesNotExist' in str(pod('worker')); assert 'Exists' in str(pod('control-plane'))
+def test_airflow_manual_fallback_and_identical_context():
+    env=airflow_logical_env(); assert all('dag_run.logical_date or dag_run.start_date' in v for v in env.values())
+    assert "in_timezone('America/Toronto')" in env['ANCHOR_DATE']
+    task=Path('orchestration/airflow/flight_tracker_task.py').read_text(); assert 'pod_template_dict=kubernetes_pod_template(selected)' in task and 'environment={' in task and 'env_vars=logical_environment' in task
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_config.py
+================================================================================
+
+from datetime import date
+from pathlib import Path
+
+import pytest
+
+from flight_price_tracker.config import load_tracking_config
+from flight_price_tracker.errors import ConfigurationError
+
+
+def test_rolling_dates_and_provider_expansion(tmp_path: Path):
+    config_file = tmp_path / "targets.yaml"
+    config_file.write_text(
+        """
+version: 1
+defaults:
+  providers: [serpapi, duffel]
+  cabin_class: economy
+  currency: CAD
+  adults: 1
+  nonstop_only: true
+  country: ca
+  language: en
+targets:
+  - id: test-route
+    origin: YYZ
+    destination: YVR
+    dates:
+      mode: rolling
+      start_days_ahead: 7
+      end_days_ahead: 21
+      step_days: 7
+""".strip()
+    )
+    config = load_tracking_config(config_file)
+    planned = config.build_search_requests(date(2026, 8, 28))
+
+    assert len(planned) == 6
+    assert {provider for provider, _ in planned} == {"serpapi", "duffel"}
+    assert [request.departure_date.isoformat() for _, request in planned[::2]] == [
+        "2026-09-04",
+        "2026-09-11",
+        "2026-09-18",
+    ]
+
+
+def test_invalid_airport_rejected(tmp_path: Path):
+    config_file = tmp_path / "targets.yaml"
+    config_file.write_text(
+        """
+version: 1
+targets:
+  - id: bad-route
+    origin: Toronto
+    destination: YVR
+    providers: [serpapi]
+    dates:
+      mode: explicit
+      values: ["2026-11-20"]
+""".strip()
+    )
+    with pytest.raises(ConfigurationError):
+        load_tracking_config(config_file)
+
+
+def test_calendar_range_skips_past_dates(tmp_path: Path):
+    config_file = tmp_path / "targets.yaml"
+    config_file.write_text(
+        """
+version: 1
+targets:
+  - id: yyz-pvg
+    origin: YYZ
+    destination: PVG
+    providers: [serpapi]
+    skip_past_dates: true
+    dates:
+      mode: calendar_range
+      start_date: "2026-11-01"
+      end_date: "2026-12-31"
+""".strip()
+    )
+    config = load_tracking_config(config_file)
+
+    planned = config.build_search_requests(date(2026, 12, 30))
+
+    assert [request.departure_date.isoformat() for _, request in planned] == [
+        "2026-12-30",
+        "2026-12-31",
+    ]
+
+
+def test_kubernetes_embeds_the_exact_portable_tracking_config():
+    manifest = Path("deploy/k8s/base/configmap.yaml").read_text().splitlines()
+    marker = manifest.index("  tracked_routes.yaml: |")
+    embedded = "\n".join(line[4:] for line in manifest[marker + 1 :]) + "\n"
+
+    assert embedded == Path("config/tracked_routes.yaml").read_text()
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_deterministic_run.py
+================================================================================
+
+from __future__ import annotations
+from datetime import date, datetime, timezone
+from pathlib import Path
+import json
+import pytest
+from flight_price_tracker.collectors.base import ProviderResult
+from flight_price_tracker.config import Settings, load_tracking_config
+from flight_price_tracker.determinism import canonical_plan, fingerprint, request_definition, request_key
+from flight_price_tracker.domain import PriceObservation, Segment
+from flight_price_tracker.errors import StorageError
+from flight_price_tracker.run_context import RunContext
+from flight_price_tracker.service import collect, resolved_plan
+
+def write_config(path:Path, extra=''):
+    path.write_text('''version: 1
+defaults:\n  providers: [serpapi]\n  cabin_class: economy\n  currency: CAD\n  adults: 1\n  nonstop_only: true\n  country: ca\n  language: en\ntargets:\n  - id: test-route\n    origin: YYZ\n    destination: YVR\n    dates:\n      mode: rolling\n      start_days_ahead: 1\n      end_days_ahead: 2\n      step_days: 1\n'''+extra)
+def settings(tmp,cfg): return Settings(cfg,tmp,'landing_zone',None,'x',None,50,10,0,True,True,False,'INFO')
+def context(attempt_day=28): return RunContext('stable-run',datetime(2026,8,28,23,55,tzinfo=timezone.utc),date(2026,8,28),datetime(2026,8,attempt_day,23 if attempt_day==28 else 1,tzinfo=timezone.utc))
+class Fake:
+    provider_name='serpapi'
+    def __init__(self,calls): self.calls=calls
+    def collect(self,request,collected_at):
+        self.calls.append((request.departure_date,collected_at))
+        o=PriceObservation('serpapi',collected_at,request.target_id,request.origin,request.destination,request.departure_date.isoformat(),request.cabin_class,request.currency, __import__('decimal').Decimal('100'),None,None,None,'sig-'+request.departure_date.isoformat(),100,0,None,[Segment(request.origin,request.destination,None,None,100,'AC','AC',None,None,'AC1')]).finalize()
+        return ProviderResult('serpapi',request,{'date':request.departure_date.isoformat()},[o])
+
+def test_same_run_across_midnight_same_directory_and_anchor(tmp_path,monkeypatch):
+    cfg=tmp_path/'c.yaml'; write_config(cfg); c=load_tracking_config(cfg); s=settings(tmp_path,cfg); calls=[]
+    monkeypatch.setattr('flight_price_tracker.service.make_collectors',lambda _: {'serpapi':Fake(calls)})
+    r1=collect(c,s,context(28)); d=r1['run_dir']; (Path(d)/'_SUCCESS').unlink()
+    r2=collect(c,s,context(29)); assert r2['run_dir']==d; assert r2['anchor_date']=='2026-08-28'; assert r2['run_definition_sha256']==r1['run_definition_sha256']; assert r2['executed_requests']==0; assert len(calls)==2
+
+def test_same_logical_run_same_plan_and_order_stable(tmp_path):
+    cfg=tmp_path/'c.yaml'; write_config(cfg); c=load_tracking_config(cfg); s=settings(tmp_path,cfg)
+    p=resolved_plan(c,s,date(2026,8,28)); assert p==resolved_plan(c,s,date(2026,8,28)); assert fingerprint(p)==fingerprint(sorted(reversed(p),key=lambda x: json.dumps(x,sort_keys=True,separators=(',',':'))))
+
+def test_request_keys_deterministic(tmp_path):
+    cfg=tmp_path/'c.yaml'; write_config(cfg); c=load_tracking_config(cfg); p,r=c.build_search_requests(date(2026,8,28))[0]; d=request_definition(p,r); assert request_key(d)==request_key(dict(reversed(list(d.items()))))
+
+def test_config_change_same_run_rejected(tmp_path,monkeypatch):
+    cfg=tmp_path/'c.yaml'; write_config(cfg); s=settings(tmp_path,cfg); calls=[]; monkeypatch.setattr('flight_price_tracker.service.make_collectors',lambda _: {'serpapi':Fake(calls)})
+    collect(load_tracking_config(cfg),s,context()); (tmp_path/'collection_date=2026-08-28/run_id=stable-run/_SUCCESS').unlink(); cfg.write_text(cfg.read_text().replace('currency: CAD','currency: USD'))
+    with pytest.raises(StorageError): collect(load_tracking_config(cfg),s,context(29))
+
+def test_partial_retry_only_missing_and_final_order(tmp_path,monkeypatch):
+    cfg=tmp_path/'c.yaml'; write_config(cfg); c=load_tracking_config(cfg); s=settings(tmp_path,cfg); calls=[]
+    class Partial(Fake):
+        def collect(self,request,collected_at):
+            if request.departure_date.day==30 and not getattr(self,'failed',False): self.failed=True; raise RuntimeError('once')
+            return super().collect(request,collected_at)
+    f=Partial(calls); monkeypatch.setattr('flight_price_tracker.service.make_collectors',lambda _: {'serpapi':f})
+    r1=collect(c,s,context()); assert r1['exit_success'] is False; assert len(calls)==1
+    r2=collect(c,s,context(29)); assert r2['executed_requests']==1 and r2['reused_requests']==1
+    normalized=list(Path(r2['run_dir'],'normalized').glob('**/observations.ndjson')); assert len(normalized)==2
+    assert all(path.read_text().splitlines()==sorted(path.read_text().splitlines()) for path in normalized)
+    with pytest.raises(StorageError): __import__('flight_price_tracker.storage.landing_zone',fromlist=['LandingZone']).LandingZone(s.output_root,context()).write_manifest({'x':1})
+
+
+def test_total_failure_is_never_marked_successful(tmp_path, monkeypatch):
+    cfg = tmp_path / 'c.yaml'; write_config(cfg); c = load_tracking_config(cfg)
+    base = settings(tmp_path, cfg)
+    permissive = Settings(
+        base.config_path, base.output_root, base.storage_mode, base.database_url,
+        base.serpapi_api_key, base.duffel_access_token, base.max_requests_per_run,
+        base.request_timeout_seconds, base.request_retries, False,
+        base.skip_successful_run, base.require_proxy, base.log_level,
+    )
+    class AlwaysFails:
+        def collect(self, request, collected_at):
+            raise RuntimeError('provider unavailable')
+    monkeypatch.setattr(
+        'flight_price_tracker.service.make_collectors',
+        lambda _: {'serpapi': AlwaysFails()},
+    )
+
+    result = collect(c, permissive, context())
+
+    assert result['status'] == 'failed'
+    assert result['exit_success'] is False
+    assert not Path(result['run_dir'], '_SUCCESS').exists()
+    assert Path(result['run_dir'], '_FAILED').exists()
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_duffel.py
+================================================================================
+
+from datetime import date
+import json
+from pathlib import Path
+
+from flight_price_tracker.collectors.duffel import DuffelCollector
+from flight_price_tracker.domain import SearchRequest
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "duffel_response.json"
+
+
+def test_duffel_normalization():
+    raw = json.loads(FIXTURE.read_text())
+    request = SearchRequest(
+        target_id="yyz-yvr",
+        origin="YYZ",
+        destination="YVR",
+        departure_date=date(2026, 11, 20),
+        cabin_class="economy",
+        currency="CAD",
+        adults=1,
+        nonstop_only=True,
+        country="ca",
+        language="en",
+    )
+
+    observations = DuffelCollector.normalize(
+        raw,
+        request,
+        "2026-08-28T12:00:00+00:00",
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert str(observation.total_amount) == "319.40"
+    assert str(observation.base_amount) == "280.00"
+    assert observation.total_duration_minutes == 310
+    assert observation.segments[0].flight_number == "AC103"
+    assert observation.provider_offer_id == "off_example"
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_filtering.py
+================================================================================
+
+from datetime import date
+from decimal import Decimal
+
+from flight_price_tracker.domain import PriceObservation, SearchRequest, Segment
+from flight_price_tracker.filtering import observation_matches_request
+
+
+def _observation():
+    return PriceObservation(
+        provider="serpapi",
+        collected_at="2026-08-28T12:00:00+00:00",
+        target_id="test",
+        search_origin="YYZ",
+        search_destination="YVR",
+        search_departure_date="2026-11-20",
+        cabin_class="economy",
+        currency="CAD",
+        total_amount=Decimal("300"),
+        base_amount=None,
+        tax_amount=None,
+        provider_offer_id="x",
+        itinerary_signature="sig",
+        total_duration_minutes=300,
+        stops=0,
+        fare_brand=None,
+        segments=[
+            Segment(
+                origin="YYZ",
+                destination="YVR",
+                departure_time_local="2026-11-20 08:00",
+                arrival_time_local="2026-11-20 10:00",
+                duration_minutes=300,
+                marketing_carrier_code="AC",
+                marketing_carrier_name="Air Canada",
+                operating_carrier_code="AC",
+                operating_carrier_name="Air Canada",
+                flight_number="AC103",
+            )
+        ],
+    ).finalize()
+
+
+def test_exact_flight_filter_matches():
+    request = SearchRequest(
+        target_id="test",
+        origin="YYZ",
+        destination="YVR",
+        departure_date=date(2026, 11, 20),
+        cabin_class="economy",
+        currency="CAD",
+        adults=1,
+        nonstop_only=True,
+        country="ca",
+        language="en",
+        include_airlines=("AC",),
+        flight_numbers=("AC103",),
+    )
+    assert observation_matches_request(_observation(), request)
+
+
+def test_exact_flight_filter_rejects_other_number():
+    request = SearchRequest(
+        target_id="test",
+        origin="YYZ",
+        destination="YVR",
+        departure_date=date(2026, 11, 20),
+        cabin_class="economy",
+        currency="CAD",
+        adults=1,
+        nonstop_only=True,
+        country="ca",
+        language="en",
+        include_airlines=("AC",),
+        flight_numbers=("AC105",),
+    )
+    assert not observation_matches_request(_observation(), request)
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_http_client.py
+================================================================================
+
+from flight_price_tracker.http_client import build_session
+
+
+def test_transport_retries_do_not_repeat_non_idempotent_posts():
+    retries = build_session(3).get_adapter("https://").max_retries
+
+    assert retries.allowed_methods == frozenset({"GET"})
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_landing_zone.py
+================================================================================
+
+from datetime import datetime,date,timezone
+from flight_price_tracker.run_context import RunContext
+from flight_price_tracker.storage.landing_zone import LandingZone
+def test_landing_zone_path_is_logical(tmp_path):
+    c=RunContext("id",datetime(2026,8,28,1,tzinfo=timezone.utc),date(2026,8,28),datetime(2026,8,29,1,tzinfo=timezone.utc))
+    l=LandingZone(tmp_path,c)
+    assert str(l.run_dir).endswith("collection_date=2026-08-28/run_id=id")
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_request_budget.py
+================================================================================
+
+from datetime import date
+from pathlib import Path
+
+import pytest
+
+from flight_price_tracker.config import load_tracking_config
+from flight_price_tracker.errors import RequestBudgetExceeded
+
+
+def test_request_budget_fails_before_collection(tmp_path: Path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+version: 1
+targets:
+  - id: dense
+    origin: YYZ
+    destination: YVR
+    providers: [serpapi, duffel]
+    dates:
+      mode: rolling
+      start_days_ahead: 1
+      end_days_ahead: 10
+      step_days: 1
+""".strip()
+    )
+    config = load_tracking_config(path)
+
+    with pytest.raises(RequestBudgetExceeded):
+        config.enforce_request_budget(date(2026, 8, 28), limit=10)
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_run_context.py
+================================================================================
+
+from datetime import datetime,timezone
+from flight_price_tracker.run_context import RunContext
+def test_cli_env_default_precedence():
+    now=datetime(2026,8,28,12,tzinfo=timezone.utc)
+    c=RunContext.resolve(cli_run_id='cli',cli_logical_at='2026-08-27T01:00:00Z',cli_anchor_date='2026-08-26',environ={'RUN_ID':'env','LOGICAL_AT':'2020-01-01T00:00:00Z','ANCHOR_DATE':'2020-01-01'},now=now)
+    assert c.run_id=='cli' and c.anchor_date.isoformat()=='2026-08-26'
+def test_local_default_uses_initial_utc_time():
+    now=datetime(2026,8,28,23,59,tzinfo=timezone.utc); c=RunContext.resolve(environ={},now=now); assert c.logical_at==now and c.anchor_date==now.date()
+
+
+================================================================================
+FILE: /home/g/projects/flight-price-tracker/tests/test_serpapi.py
+================================================================================
+
+from datetime import date
+import json
+from pathlib import Path
+
+from flight_price_tracker.collectors.serpapi import SerpApiCollector
+from flight_price_tracker.domain import SearchRequest
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "serpapi_response.json"
+
+
+def test_serpapi_normalization():
+    raw = json.loads(FIXTURE.read_text())
+    request = SearchRequest(
+        target_id="yyz-yvr",
+        origin="YYZ",
+        destination="YVR",
+        departure_date=date(2026, 11, 20),
+        cabin_class="economy",
+        currency="CAD",
+        adults=1,
+        nonstop_only=True,
+        country="ca",
+        language="en",
+    )
+
+    observations = SerpApiCollector.normalize(
+        raw,
+        request,
+        "2026-08-28T12:00:00+00:00",
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert str(observation.total_amount) == "312"
+    assert observation.currency == "CAD"
+    assert observation.stops == 0
+    assert observation.segments[0].flight_number == "AC103"
+    assert observation.segments[0].marketing_carrier_code == "AC"
+    assert observation.record_key
+
+
+def test_serpapi_no_results_is_a_successful_empty_search():
+    class EmptyResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "error": "Google Flights hasn't returned any results for this query."
+            }
+
+    class EmptySession:
+        @staticmethod
+        def get(*args, **kwargs):
+            return EmptyResponse()
+
+    request = SearchRequest(
+        target_id="yyz-pvg",
+        origin="YYZ",
+        destination="PVG",
+        departure_date=date(2026, 11, 1),
+        cabin_class="economy",
+        currency="CAD",
+        adults=1,
+        nonstop_only=True,
+        country="ca",
+        language="en",
+    )
+
+    result = SerpApiCollector("key", EmptySession(), 10).collect(
+        request, "2026-08-28T20:45:00Z"
+    )
+
+    assert result.observations == []
+    assert "hasn't returned any results" in result.raw["error"]
+
