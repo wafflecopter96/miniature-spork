@@ -1,0 +1,5146 @@
+SNAPSHOT: canadian-grocery-sale-scraper
+SOURCE ROOT: /home/<USER>/projects/canadian-grocery-sale-scraper
+PURPOSE: Curated, model-readable snapshot of tracked human-authored project files.
+EXCLUSIONS: secrets and secret templates, personal data, generated/runtime data, caches, bytecode, build artifacts, and obsolete backups.
+PUBLIC-SANITIZED: Environment-specific identifiers have been replaced. RFC 5737 documentation addresses (192.0.2.0/24) are examples only and must be overridden for deployment.
+
+
+================================================================================
+FILE: .dockerignore
+================================================================================
+
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+tests
+config
+README.md
+DESIGN.md
+Makefile
+
+
+================================================================================
+FILE: .gitignore
+================================================================================
+
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+config/config.toml
+.env
+output/
+*.bak-*
+
+
+================================================================================
+FILE: DESIGN.md
+================================================================================
+
+# Design and handoff document
+
+## 1. Purpose and status
+
+This repository implements a production-shaped private collector for Canadian
+grocery flyer data available through Flipp's unofficial web JSON endpoints. It
+is intended to be launched as a short-lived Docker job by Compose today and by
+an external scheduler later.
+
+Version `0.2.0` includes these collector capabilities:
+
+- strict configuration and postal-code resolution;
+- merchant/flyer discovery;
+- explicit allowlist and broad category-driven selection modes;
+- active/future flyer handling;
+- complete raw response preservation;
+- enriched, lossless item wrappers;
+- retries, bounds, atomic writes, manifests, and completion markers;
+- Proton VPN routing through the existing Gluetun container;
+- offline unit and end-to-end CLI tests.
+
+It also includes an independently networked, optional item-classification
+worker. The worker is downstream of collection and does not alter the
+collector's raw, normalized, manifest, or completion contracts.
+
+It intentionally contains no scheduler definition, database, dbt model,
+dashboard, alerting integration, shopping-list logic, product matching, or
+automatic data deletion.
+
+## 2. Requirements and design decisions
+
+### Isolation
+
+The project does not write below `/var/lib/retail-sale-scrapers`. Its default
+root is `/var/lib/grocery-sale-scraper`, its image and Compose project names are
+unique, and its output starts with `source=flipp-unofficial`. This prevents
+existing glob readers from accidentally treating the data as Uniqlo or Banana
+Republic output.
+
+### Lossless-first collection
+
+The principal historical record is the exact upstream response body. Parsing
+is additive: enriched records make common fields accessible but embed the
+complete upstream item under `source_item`. Newly introduced upstream fields
+therefore survive even before the application understands them.
+
+Raw responses are stored once per request. Flyer-level metadata is not repeated
+in every raw item. The enriched layer repeats a compact provenance subset so an
+individual record remains intelligible when extracted from its run.
+
+### Explicit completion
+
+All files use write-to-sibling-and-rename semantics. `manifest.json` is written
+after data files and `_SUCCESS` is written last. Consumers must use `_SUCCESS`
+as the commit marker. An exception leaves an inspectable incomplete directory
+without `_SUCCESS`.
+
+Stable run IDs can resume an incomplete run by atomically replacing the same
+known paths. A completed run ID is immutable. Scheduler retries must use the
+same configuration and application version; changing configuration during a
+retry can leave unreferenced files from the earlier failed attempt. Only files
+listed in the successful manifest are part of the committed dataset.
+
+## 3. Upstream interface
+
+The default base is:
+
+```text
+https://backflipp.wishabi.com/flipp
+```
+
+The client uses:
+
+```text
+GET /flyers?postal_code=<FULL>&locale=en-CA
+GET /flyers/<FLYER_ID>?postal_code=<FULL>&locale=en-CA
+```
+
+The first response is expected to be an object with a `flyers` array. Each
+flyer must have an integer `id` and non-empty `merchant`. The detail response is
+expected to be an object with an `items` array; other top-level fields such as
+`pages` and corrections are retained without interpretation.
+
+These endpoints are not a supported public contract. Schema checks deliberately
+fail rather than silently emitting incomplete normalized data. The raw listing
+is written before selection so a missing required merchant can be diagnosed
+from the failed run.
+
+## 4. Collection flow
+
+```text
+load strict TOML
+      │
+resolve and normalize postal code
+      │
+fetch complete flyer listing ──→ raw/listing
+      │
+validate and classify every flyer
+      │
+apply category + time + merchant + name filters
+      │
+persist discovery and selected metadata
+      │
+fetch each selected flyer sequentially ──→ raw/flyers/flyer_id=...
+      │
+validate items; retain priced and unpriced records
+      │
+write lossless enriched records grouped by local retailer ID
+      │
+write manifest ──→ publish _SUCCESS
+```
+
+Detail requests are sequential and delayed by `request_delay_seconds`. This is
+deliberately conservative for a small daily job. If concurrency is later added,
+it must retain a global rate limiter rather than merely starting one thread per
+flyer.
+
+## 5. Flyer selection contract
+
+Selection is evaluated at collection time:
+
+1. Normalize flyer categories whether upstream sends a string or array.
+2. Require an exact normalized match with one configured category unless the
+   category array is empty.
+3. Classify the flyer from timezone-aware `valid_from` and `valid_to` as
+   `active`, `future`, or `expired`. Missing bounds are treated as open bounds;
+   malformed timestamps fail.
+4. Always reject expired flyers.
+5. Reject future flyers unless `include_future` is true.
+6. In `allowlist`, match the normalized source merchant name to exactly one
+   configured alias, then apply optional flyer-name regular expressions.
+7. In `all_matching`, derive a local ID from the merchant name. A slug collision
+   fails and requires an explicit allowlist.
+
+A configured required merchant with zero eligible flyers fails collection.
+An absent optional merchant creates a manifest warning. Multiple eligible
+flyers for one merchant are all collected, because seasonal inserts and weekly
+flyers can legitimately overlap.
+
+Flyer IDs are never configured: they change every publication cycle.
+
+## 6. Configuration contract
+
+`schema_version` gates incompatible configuration changes. Unknown fields are
+errors so a misspelling cannot silently broaden or narrow collection.
+
+The postal code can be supplied inline, through `postal_code_file`, or as a CLI
+override. Inline configuration is supported for testing, but a separate
+mode-`600` file is recommended for deployment. Both forms at once are invalid.
+
+Merchant IDs and `location_id` use lowercase slug syntax. Source names remain
+display strings and compare after case folding and internal whitespace
+normalization. Assigning the same source alias to multiple merchants is an
+error.
+
+The HTTP base is configurable to permit a future compatible proxy or fixture
+server, but must use HTTPS. Timeouts, attempts, and response-size bounds have
+hard safety ranges.
+
+## 7. Output contract
+
+### Raw response
+
+`response.json` contains the bytes returned upstream, not re-serialized JSON.
+This preserves unknown fields, number/string distinctions, nulls, key ordering,
+and response formatting.
+
+Adjacent `request.json` contains:
+
+- the request URL with `postal_code` replaced by `<redacted>`;
+- UTC fetch timestamp;
+- status and attempt count;
+- all response headers except cookie-setting headers;
+- response byte count and SHA-256.
+
+### Discovery and selection
+
+`selection/discovery.json` describes every flyer returned by the listing and
+records category match, temporal state, selected status, and local retailer ID.
+`selection/selected_flyers.json` retains the complete listing metadata for each
+selected flyer.
+
+### Enriched items
+
+Each `normalized/retailer=<ID>/items.json` is a JSON array. Each record includes:
+
+- schema and source identifiers;
+- location and local retailer IDs;
+- exact source merchant name;
+- flyer ID, name, categories, and validity;
+- observation timestamp;
+- commonly used item fields without coercing their upstream types;
+- a deterministic SHA-256 fingerprint over merchant, name, and brand;
+- `source_item`, the complete upstream item object.
+
+The fingerprint is a comparison aid, not a product identity. Flyer entries can
+combine multiple sizes or products, spelling can change, and IDs are not known
+to be stable across weeks.
+
+### Manifest
+
+The manifest identifies application/run/config schema versions, source,
+location, FSA, locale, selection behavior, selected flyer validity, per-retailer
+item counts, warnings, and the size/hash/kind of every committed data file.
+The full postal code is deliberately absent.
+
+## 8. HTTP and failure behavior
+
+Requests have a configured timeout and a maximum body size. HTTP 429 and 5xx,
+network failures, timeouts, and invalid JSON are retried up to `max_attempts`.
+`Retry-After` is honored up to 60 seconds. Non-retryable HTTP errors fail
+immediately. Cookie-setting response headers are not persisted.
+
+The following are fatal:
+
+- unreadable or invalid configuration/postal code;
+- missing VPN container at Docker startup;
+- failed egress-country assertion when explicitly checked;
+- malformed listing/flyer schemas;
+- duplicate flyer IDs;
+- required merchants with no eligible flyer;
+- no selected flyer;
+- any selected flyer fetch failure;
+- unsafe output paths or a previously completed run ID.
+
+An empty selected flyer is not fatal because an upstream publication can be
+image-only; it creates a warning. Partial successful subsets are never marked
+complete.
+
+## 9. Container and VPN model
+
+The image is based on `python:3.13-alpine`, contains no third-party Python
+packages, and runs as UID/GID 1000 with a read-only root filesystem, dropped
+capabilities, `no-new-privileges`, a small tmpfs, and a PID limit.
+
+Collectors join only the internal `proton-egress` network and use the Gluetun
+HTTP CONNECT proxy at `http://proton-egress:8888`. In Docker this resolves to
+the gateway's network alias; in Kubernetes the same name resolves through the
+headless `private-apps/proton-egress` Service to the centralized Tailscale
+endpoint. The Docker network has no direct Internet route, while Gluetun keeps
+its own firewall enabled, providing fail-closed behavior without namespace
+sharing. The `egress` command uses
+ipinfo and can assert the expected country. Enrichment and notifications remain
+separate stages.
+
+The enrichment worker reads the dbt-owned
+`silver.slv_grocery_unclassified_concepts` view from DuckDB in read-only mode.
+It joins only the external `ollama-network` network, submits small sequential
+batches using an enum-constrained JSON schema, and atomically writes a compact
+append-only classification dataset. Every validated key is durably committed
+to an atomic key-named JSON file before the worker logs batch progress. An
+incomplete-run retry validates and skips existing key files, classifies only
+missing keys, and consolidates all records into `classifications.json` before
+publishing `manifest.json` and the final `_SUCCESS` marker. It does not rewrite
+or duplicate complete offer records. A classifier-version partition
+deliberately invalidates the lookup when taxonomy, prompt, normalization, or
+output semantics change.
+
+The configuration, postal-code file, and dedicated data root are three separate
+bind mounts. Compose disables automatic host-path creation so path mistakes fail
+instead of producing root-owned directories.
+
+## 10. Scheduler interface
+
+The Airflow integration under `orchestration/airflow` selects either
+`DockerOperator` or `KubernetesPodOperator` at DAG-parse time. Both operators
+launch the same digest-pinned collector image with:
+
+```text
+command: collect --config /run/config/config.toml --run-id <LOGICAL_UTC_TIME>
+network_mode: proton-egress
+environment: HTTP_PROXY=http://proton-egress:8888
+```
+
+It must mount the same three paths as Compose and should not retry with a new
+run ID. One daily execution is proportionate to weekly flyer changes. The
+container's nonzero exit status is the complete failure signal.
+
+Docker uses the established host bind mounts and internal proxy network.
+Kubernetes uses equivalent ConfigMap, Secret, and output mounts plus the
+fail-closed Pod-network iptables init container. Placement is selected as
+`worker`, `control-plane`, or `any`; only the latter two receive the narrow
+control-plane `NoSchedule` toleration. Production Kubernetes runs
+require an RWX PVC backed by the same canonical directory Docker mounts; there
+is deliberately no node-local fallback that could strand completed data away
+from downstream consumers.
+
+## 11. Testing strategy
+
+Tests make no network calls. Curated listing/detail fixtures include unknown
+fields and unpriced items to prove lossless retention. The suite covers strict
+configuration, postal normalization, selection windows, required-merchant
+handling, enriched provenance, byte preservation, cookie-header exclusion,
+response bounds, request URL redaction, manifest contents, and `_SUCCESS`.
+
+Before changing upstream parsing, add or update a sanitized fixture that
+demonstrates the observed schema. Live smoke tests should use the VPN and a
+temporary output root, never the Git working tree.
+
+## 12. Privacy, legal, and operational risks
+
+- A full postal code is sent to the upstream service and reveals a small local
+  area. Keep it outside Git. Run output retains only the FSA, though the raw
+  upstream response could itself add location data in the future.
+- Flipp may log the VPN exit address, request headers, postal code, locale, and
+  request patterns.
+- The unofficial source can change or disappear without notice.
+- Flipp's published terms restrict automated collection and database storage.
+  The operator is responsible for determining acceptable use. If authorized
+  FlyerKit access becomes available, implement it as a new source adapter and
+  output source partition rather than pretending the schemas are identical.
+- Flyer data is advertised promotional data, not a complete store catalogue,
+  branch inventory, or guaranteed checkout price.
+- Raw storage grows monotonically. Capacity monitoring and retention are
+  external operational responsibilities; this collector never deletes data.
+
+## 13. Extension points
+
+The current source-specific code is isolated in `flipp.py`. A future source
+should expose listing/discovery, selection provenance, and exact raw response
+objects while retaining the same run writer contract.
+
+Likely future additions, in order of value:
+
+1. captured production-schema fixtures when upstream changes;
+2. conditional requests or content-addressed raw deduplication, if supported;
+3. correction-notice normalization without removing raw fields;
+4. an explicit store-location dimension for retailer-direct integrations;
+5. metrics or notification callbacks outside this repository;
+6. a separately designed archival/retention tool.
+
+Do not add destructive pruning to the collector command, silently skip selected
+flyer failures, log the full postal code, or remove `source_item` in favor of a
+smaller schema without a separately versioned migration.
+
+## 14. Handoff checklist
+
+Before enabling unattended collection:
+
+- copy and review `config/config.example.toml`;
+- run discovery and verify every exact merchant alias;
+- decide which merchants are required versus optional;
+- create and permission the external postal-code file;
+- create the dedicated UID/GID-1000 output root;
+- confirm the centralized `proton-egress-scrapers` gateway is healthy;
+- run the country-checked egress command;
+- run `make test`, `docker compose config -q`, and `docker compose build`;
+- perform one live collection with a unique run ID;
+- inspect raw payloads, counts, warnings, manifest hashes, and `_SUCCESS`;
+- document external scheduling and storage-capacity ownership.
+
+
+================================================================================
+FILE: Dockerfile
+================================================================================
+
+FROM python:3.13-slim AS worker
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src
+
+COPY requirements-worker.txt ./requirements-worker.txt
+RUN pip install --no-cache-dir --requirement requirements-worker.txt
+
+COPY --chmod=0555 src ./src
+
+USER 1000:1000
+
+ENTRYPOINT ["python", "-m", "grocery_sale_scraper"]
+
+
+FROM python:3.13-alpine AS collector
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src
+
+COPY --chmod=0555 src ./src
+
+USER 1000:1000
+
+ENTRYPOINT ["python", "-m", "grocery_sale_scraper"]
+
+
+================================================================================
+FILE: LICENSE
+================================================================================
+
+Copyright (c) 2026 <COPYRIGHT_HOLDER>. All rights reserved.
+
+This software and its source code are private and proprietary. No permission is
+granted to use, copy, modify, publish, distribute, sublicense, or sell any part
+of this software without the copyright holder's prior written permission.
+
+
+================================================================================
+FILE: Makefile
+================================================================================
+
+.PHONY: test build validate-compose
+
+test:
+	PYTHONPATH=src python3 -m unittest discover -s tests -v
+
+build:
+	docker compose build
+
+validate-compose:
+	docker compose config -q
+
+
+================================================================================
+FILE: README.md
+================================================================================
+
+# Canadian grocery sale scraper
+
+A standalone, configurable collector for Canadian grocery flyers exposed by
+Flipp's unofficial JSON endpoints. The same collector image runs as a
+short-lived, read-only container through Docker or Kubernetes and reaches the
+existing Proton VPN/Gluetun gateway through its fail-closed HTTP proxy. It
+preserves complete upstream responses before producing enriched item records
+for convenient querying.
+
+The repository also builds a separate DuckDB-capable worker. Its `enrich`
+command reads a dbt view of product-text concepts that do not yet have a
+classification, calls a shared Ollama instance, and writes only compact
+classification rows. Full flyer offers are not copied into the enrichment
+dataset.
+
+This project is deliberately isolated from `retail-sale-scrapers`:
+
+- its image is `canadian-grocery-sale-scraper:latest`;
+- its default host output root is `/var/lib/grocery-sale-scraper`;
+- its files live below `source=flipp-unofficial/`;
+- it has no dbt, database, dashboard, or notification integration.
+
+See [DESIGN.md](DESIGN.md) for the system contract, failure semantics, output
+schemas, extension points, operational assumptions, and handoff notes.
+
+## Important upstream caveat
+
+The endpoints are undocumented implementation details used by Flipp's web
+experience. They may change, reject requests, or return new schemas without
+notice. Flipp's published terms restrict scraping and storing application
+content. This repository does not grant rights to the upstream data. Review the
+terms and intended private use before operating it.
+
+## What is retained
+
+Every successful run stores:
+
+- the exact bytes of the complete postal-code flyer-list response;
+- the exact bytes of every selected flyer-detail response, including `pages`,
+  unpriced items, and unknown future fields;
+- sanitized request/response metadata and response hashes;
+- the complete discovered flyer inventory and exact selected flyer metadata;
+- enriched records whose `source_item` field contains the untouched upstream
+  item object;
+- a manifest containing file hashes, counts, validity windows, and warnings;
+- `_SUCCESS`, written last, as the only completion signal.
+
+The collector intentionally does not discard unpriced items. There is no
+automatic retention or pruning policy.
+
+## Initial setup
+
+Create a local configuration from the tracked example:
+
+```bash
+cd /home/<USER>/projects/canadian-grocery-sale-scraper
+cp config/config.example.toml config/config.toml
+```
+
+Store the postal code outside Git:
+
+```bash
+install -d -m 700 /home/<USER>/.config/grocery-sale-scraper
+printf '%s\n' '<REDACTED_POSTAL_CODE>' > /home/<USER>/.config/grocery-sale-scraper/postal-code
+chmod 600 /home/<USER>/.config/grocery-sale-scraper/postal-code
+```
+
+Replace `<REDACTED_POSTAL_CODE>` with the full Canadian postal code, with or without its space.
+The application normalizes it to uppercase `<REDACTED_POSTAL_CODE>` form. The full value is
+sent upstream but is not written to run metadata; only its three-character FSA
+is recorded.
+
+Create the dedicated output directory for container UID/GID 1000:
+
+```bash
+sudo install -d -o 1000 -g 1000 /var/lib/grocery-sale-scraper
+```
+
+Build and validate:
+
+```bash
+docker compose config -q
+docker compose build
+```
+
+The centralized gateway must be healthy and the internal `proton-egress`
+network must exist. Override `PROTON_EGRESS_NETWORK` or `PROTON_PROXY_URL` only
+for an equivalent fail-closed deployment.
+
+## Confirm Proton VPN egress
+
+The check fails unless the reported country is Canada by default:
+
+```bash
+docker compose run --rm egress
+```
+
+Override the expected country explicitly if the Proton exit location differs:
+
+```bash
+VPN_REQUIRED_COUNTRY=US docker compose run --rm egress
+```
+
+Collectors use only the internal `proton-egress` network and the proxy at
+`http://proton-egress:8888`. Docker resolves that network alias directly;
+Kubernetes resolves the matching headless Service through CoreDNS. The Docker
+network has no direct Internet route, and Gluetun's firewall remains enabled,
+so the path fails closed.
+
+## Discover merchants for the postal code
+
+```bash
+docker compose run --rm discover
+```
+
+The `SEL` column shows which current flyers the configuration would collect.
+Show every returned category or request structured output with:
+
+```bash
+docker compose run --rm discover --all-categories
+docker compose run --rm discover --json
+```
+
+Edit `config/config.toml` using the exact merchant names returned by discovery.
+Merchant IDs are local stable identifiers; source names are exact upstream
+aliases after whitespace and case normalization.
+
+## Collect
+
+```bash
+docker compose run --rm collect
+```
+
+Supply a deterministic run ID for scheduler retries:
+
+```bash
+docker compose run --rm collect --run-id 20260825T100000Z
+```
+
+Successful output resembles:
+
+```text
+/var/lib/grocery-sale-scraper/
+└── source=flipp-unofficial/
+    └── location_id=home/
+        └── run_id=20260825T100000Z/
+            ├── raw/
+            │   ├── listing/{request.json,response.json}
+            │   └── flyers/flyer_id=123/{request.json,response.json}
+            ├── selection/
+            │   ├── discovery.json
+            │   └── selected_flyers.json
+            ├── normalized/
+            │   └── retailer=no-frills/items.json
+            ├── manifest.json
+            └── _SUCCESS
+```
+
+Consumers must ignore a run directory unless `_SUCCESS` exists.
+
+## Airflow operator portability
+
+The data collector can be launched from the same digest-pinned image by either
+Airflow `DockerOperator` or `KubernetesPodOperator`. The selectable task factory,
+manual-only test DAG, provider versions, Kubernetes runtime ConfigMap, and setup
+instructions are in
+[`orchestration/airflow/README.md`](orchestration/airflow/README.md).
+The verified cluster state, safety constraints, production gaps, storage
+recommendation, and end-to-end cutover criteria are recorded in
+[`docs/KUBERNETES-AIRFLOW-HANDOFF.md`](docs/KUBERNETES-AIRFLOW-HANDOFF.md).
+
+Docker mode retains the production host mounts and internal proxy network.
+Kubernetes mode defaults to role-based `worker` placement and also supports
+`control-plane` or `any` through deployment configuration. It requires the
+shared `grocery-output` PVC. Both modes therefore expose the same canonical
+backing directory at `/app/output`; Kubernetes has no production node-local
+fallback. Installing the test DAG does not modify or schedule the existing
+production DAG.
+
+## Configuration
+
+The format is strict TOML: unknown keys and invalid types fail immediately.
+The tracked [config example](config/config.example.toml) documents every field.
+
+Key choices:
+
+- `selection_mode = "allowlist"` selects only configured merchants and is the
+  recommended unattended mode.
+- `selection_mode = "all_matching"` selects every merchant having a matching
+  category and derives IDs from merchant names.
+- `categories = ["Groceries"]` excludes unrelated flyers. Use `[]` for every
+  category.
+- `include_future = true` fetches selected future flyers in addition to active
+  flyers. Expired flyers are never fetched, although the complete listing
+  response is still retained.
+- `required = true` makes a missing eligible flyer fail the collection.
+- optional include/exclude regular expressions narrow overlapping flyers for a
+  merchant. With no patterns, every eligible flyer is retained.
+- `request_delay_seconds` provides a delay before each detail request.
+
+For ad hoc host-side use, configuration values can be overridden without
+editing files:
+
+```bash
+PYTHONPATH=src python3 -m grocery_sale_scraper discover \
+  --config config/config.toml --postal-code '<REDACTED_POSTAL_CODE>'
+
+PYTHONPATH=src python3 -m grocery_sale_scraper collect \
+  --config config/config.toml \
+  --postal-code-file /path/to/postal-code \
+  --output-dir /tmp/grocery-output
+```
+
+## Tests
+
+The test suite is offline and uses only the Python standard library:
+
+```bash
+make test
+```
+
+It covers configuration validation, postal normalization, selection, unknown
+field retention, response-size limits, exact raw bytes, URL redaction, hashes,
+completion markers, and a complete fixture-backed collection run.
+
+## Incremental item classification
+
+Build both the minimal collector and DuckDB-capable worker images:
+
+```bash
+docker compose build collect enrich
+```
+
+The worker expects `dbt project` to have created
+`silver.slv_grocery_unclassified_concepts` in the configured DuckDB catalog.
+Run a deterministic enrichment batch with the source collection run ID:
+
+```bash
+GROCERY_SOURCE_RUN_ID=20260825T140000Z \
+  docker compose run --rm enrich
+```
+
+Before a scheduled batch, Airflow runs `warm-ollama` on the same worker image
+and `ollama-network` network. It sends a non-streaming empty generate request
+with the configured keep-alive so model loading happens before classification.
+Run it manually when needed:
+
+```bash
+docker compose run --rm enrich warm-ollama
+```
+
+The `enrich` service joins only the external `ollama-network` network and uses
+`http://ollama:11434` with `gemma4:12b-it-q8_0` by default. Override
+these through `OLLAMA_BASE_URL` and `OLLAMA_MODEL`. Enrichment defaults to five
+concepts per batch with a 600-second Ollama request timeout.
+
+Classifications are written below `${GROCERY_ENRICHMENT_OUTPUT_ROOT}`:
+
+```text
+dataset=item-classifications/
+└── classifier_version=grocery-v1/
+    └── run_id=<source-run-id>/
+        ├── classifications/
+        │   └── classification_key=<sha256>.json
+        ├── classifications.json
+        ├── manifest.json
+        └── _SUCCESS
+```
+
+The classification key is derived from normalized item name and brand, without
+retailer, flyer, price, or date. Consequently a recurring product concept is
+classified once and reused by dbt views across retailers and later flyer runs.
+Completed classification runs are immutable and consumers must require their
+`_SUCCESS` marker.
+
+Each model-validated classification is first written atomically to its own
+key-named file. Airflow receives a flushed progress line after every validated
+batch. If the task is retried before `_SUCCESS` exists, the worker validates
+and reuses those files, sends only missing keys to Ollama, then rebuilds the
+ordered `classifications.json`. It publishes `manifest.json` and `_SUCCESS`
+only after every input concept has a durable per-key record and the aggregate
+has been written successfully.
+
+
+================================================================================
+FILE: compose.yaml
+================================================================================
+
+name: canadian-grocery-sale-scraper
+
+x-runtime: &runtime
+  image: ${CANADIAN_GROCERY_SALE_SCRAPER_IMAGE:-canadian-grocery-sale-scraper:latest}
+  read_only: true
+  user: "1000:1000"
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 64
+
+x-collector: &collector
+  <<: *runtime
+  network_mode: "${PROTON_EGRESS_NETWORK:-proton-egress}"
+  environment:
+    HTTP_PROXY: &proton_proxy ${PROTON_PROXY_URL:-http://proton-egress:8888}
+    HTTPS_PROXY: *proton_proxy
+    http_proxy: *proton_proxy
+    https_proxy: *proton_proxy
+    NO_PROXY: &no_proxy localhost,127.0.0.1
+    no_proxy: *no_proxy
+
+services:
+  collect:
+    <<: *collector
+    build:
+      context: .
+    command:
+      - collect
+      - --config
+      - /run/config/config.toml
+    volumes:
+      - type: bind
+        source: ${GROCERY_SCRAPER_CONFIG:-./config/config.toml}
+        target: /run/config/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${GROCERY_POSTAL_CODE_FILE:-/home/<USER>/.config/grocery-sale-scraper/postal-code}
+        target: /run/secrets/postal-code
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${GROCERY_SCRAPER_OUTPUT_ROOT:-/var/lib/grocery-sale-scraper}
+        target: /app/output
+        bind:
+          create_host_path: false
+
+  discover:
+    <<: *collector
+    command:
+      - discover
+      - --config
+      - /run/config/config.toml
+    volumes:
+      - type: bind
+        source: ${GROCERY_SCRAPER_CONFIG:-./config/config.toml}
+        target: /run/config/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${GROCERY_POSTAL_CODE_FILE:-/home/<USER>/.config/grocery-sale-scraper/postal-code}
+        target: /run/secrets/postal-code
+        read_only: true
+        bind:
+          create_host_path: false
+
+  egress:
+    <<: *collector
+    command:
+      - egress
+      - --require-country
+      - ${VPN_REQUIRED_COUNTRY:-CA}
+
+  enrich:
+    <<: *runtime
+    image: ${CANADIAN_GROCERY_SALE_WORKER_IMAGE:-canadian-grocery-sale-worker:latest}
+    build:
+      context: .
+      target: worker
+    command:
+      - enrich
+      - --catalog-path
+      - /var/lib/retail-sale-analytics/retail_sales.duckdb
+      - --output-dir
+      - /app/enrichment-output
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:26b-a4b-it-qat}
+      OLLAMA_CONTEXT_SIZE: ${OLLAMA_CONTEXT_SIZE:-262144}
+      OLLAMA_MAX_CONTEXT_SIZE: ${OLLAMA_MAX_CONTEXT_SIZE:-262144}
+      GROCERY_CLASSIFIER_VERSION: ${GROCERY_CLASSIFIER_VERSION:-grocery-v1}
+      GROCERY_SOURCE_RUN_ID: ${GROCERY_SOURCE_RUN_ID:-}
+    volumes:
+      - type: bind
+        source: ${DUCKDB_DATA_ROOT:-/var/lib/retail-sale-analytics}
+        target: /var/lib/retail-sale-analytics
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${GROCERY_ENRICHMENT_OUTPUT_ROOT:-/var/lib/grocery-sale-enrichment}
+        target: /app/enrichment-output
+        bind:
+          create_host_path: false
+      # dbt persists this canonical path in its DuckDB file-backed views. The
+      # worker writes through /app/enrichment-output, but must also be able to
+      # resolve the same dataset at the path stored in the catalog.
+      - type: bind
+        source: ${GROCERY_ENRICHMENT_OUTPUT_ROOT:-/var/lib/grocery-sale-enrichment}
+        target: /var/lib/grocery-sale-enrichment
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - ollama_network
+
+networks:
+  ollama_network:
+    external: true
+    name: ollama-network
+
+
+================================================================================
+FILE: config/config.example.toml
+================================================================================
+
+schema_version = 1
+location_id = "home"
+locale = "en-CA"
+
+# Keep the full postal code outside Git. The path is inside the container.
+postal_code_file = "/run/secrets/postal-code"
+
+# "allowlist" collects only configured merchants. "all_matching" collects
+# every merchant with an eligible flyer and derives stable-looking IDs from
+# merchant names; allowlist is safer for unattended operation.
+selection_mode = "allowlist"
+categories = ["Groceries"]
+include_future = false
+request_delay_seconds = 0.5
+
+[http]
+api_base = "https://backflipp.wishabi.com/flipp"
+timeout_seconds = 30
+max_attempts = 4
+max_response_bytes = 52428800
+
+# Run `grocery-sales discover` for the configured postal code, then replace
+# these examples with the exact merchants you want to retain.
+[[merchants]]
+id = "no-frills"
+source_names = ["No Frills"]
+required = true
+
+[[merchants]]
+id = "food-basics"
+source_names = ["Food Basics"]
+required = true
+
+[[merchants]]
+id = "freshco"
+source_names = ["FreshCo"]
+required = false
+
+[[merchants]]
+id = "walmart"
+source_names = ["Walmart"]
+required = false
+# Optional Python regular expressions can narrow a merchant's overlapping
+# flyers. Omitting them retains every eligible active flyer for that merchant.
+# include_flyer_name_patterns = ["Weekly", "Flyer"]
+# exclude_flyer_name_patterns = ["Back to School"]
+
+
+================================================================================
+FILE: docs/KUBERNETES-AIRFLOW-HANDOFF.md
+================================================================================
+
+# Kubernetes collection runbook
+
+Last updated: 2026-08-27
+
+The workspace-level `<CLUSTER_RUNBOOK>` is the source of
+truth for cluster topology, CNI, runtime sockets, registry trust, firewall,
+CoreDNS, and shared infrastructure. Read it before changing live cluster
+configuration. This file covers only the grocery collector contract.
+
+## Invariants
+
+- DockerOperator and KubernetesPodOperator launch the same digest-pinned
+  `CANADIAN_GROCERY_SALE_SCRAPER_IMAGE` with the same `collect` command and
+  logical-date-derived run ID.
+- `/app/output` is always the canonical
+  `/var/lib/grocery-sale-scraper` dataset: a bind mount in Docker and the
+  `private-apps/grocery-output` RWX PVC in Kubernetes. The production backing
+  directory is `<GROCERY_STORAGE_BACKING_PATH>` on the secondary SSD.
+- Kubernetes configuration comes from
+  `private-apps/grocery-collector-config`; the postal code comes from
+  `private-apps/grocery-collector-postal-code`.
+- The container image contains neither deployment configuration nor secrets.
+- dbt, DuckDB, enrichment, output layouts, `manifest.json`, and `_SUCCESS` are
+  outside this placement control and remain unchanged.
+- The centralized Proton proxy is the only Internet path. Kubernetes resolves
+  the headless `private-apps/proton-egress` Service through CoreDNS; it does not
+  use `hostAliases`.
+
+## Deployment controls
+
+Backend and placement are independent:
+
+```text
+GROCERY_COLLECTION_OPERATOR=docker|kubernetes
+SCRAPER_KUBERNETES_PLACEMENT=worker|control-plane|any
+GROCERY_KUBERNETES_PLACEMENT=worker|control-plane|any
+```
+
+The grocery-specific placement, when set, overrides the shared placement.
+Placement has no effect in Docker mode, which is the explicit control-plane
+rollback path.
+
+| Placement | Required scheduling | Toleration |
+| --- | --- | --- |
+| `worker` | Control-plane role label must be absent | None |
+| `control-plane` | Control-plane role label must be present | `node-role.kubernetes.io/control-plane:NoSchedule` only |
+| `any` | No required role | Same narrow control-plane toleration |
+
+Never remove the control-plane taint for application convenience. Adding a
+future worker requires its normal cluster, registry-trust, NFS-client, and NFS
+export onboarding; the application image and command do not change.
+
+## Install or update runtime objects
+
+Apply the non-secret runtime objects and static storage objects:
+
+```bash
+kubectl --kubeconfig /home/<USER>/.kube/config apply \
+  -f k8s/grocery-collector-runtime.yaml
+kubectl --kubeconfig /home/<USER>/.kube/config apply \
+  -f k8s/grocery-output-storage.yaml
+```
+
+Create or rotate the postal-code Secret without writing the value to Git:
+
+```bash
+kubectl --kubeconfig /home/<USER>/.kube/config -n private-apps \
+  create secret generic grocery-collector-postal-code \
+  --from-file=postal-code=/home/<USER>/.config/grocery-sale-scraper/postal-code \
+  --dry-run=client -o yaml | \
+kubectl --kubeconfig /home/<USER>/.kube/config apply -f -
+```
+
+The static PV has reclaim policy `Retain`. Do not add a `hostPath` fallback or
+put DuckDB on the NFS export. See `k8s/README.md` for NFS ownership, export,
+backup, and mount requirements.
+
+## Pod policy
+
+The collector runs as UID/GID 1000 with a read-only root filesystem, dropped
+capabilities, RuntimeDefault seccomp, a bounded `/tmp`, and CPU, memory, and
+ephemeral-storage requests/limits. Its service-account token is not mounted.
+
+An unprivileged init container verifies RWX output access. A separate root init
+container has only `NET_ADMIN`; it allows loopback, established connections,
+DNS to the Pod resolver, and TCP to the configured Proton endpoint before
+setting the Pod OUTPUT policy to DROP. Proxy variables use
+`http://proton-egress:8888` in both Docker and Kubernetes.
+
+## Release and deployment copy
+
+Publish images through `<CONTAINER_REGISTRY_WORKSPACE>`; do not move an
+existing tag. The released `tag@sha256:digest` in `releases/current.env` must be
+used by both operators.
+
+The deployed Airflow copy of
+`orchestration/airflow/grocery_collection_task.py` lives at
+`<AIRFLOW_DAGS_DIR>/grocery_collection_task.py`. Copy it as an exact
+release step and verify the two files remain byte-identical before reparsing
+the DAG.
+
+## Validation
+
+Before selecting Kubernetes, require:
+
+```bash
+kubectl --kubeconfig /home/<USER>/.kube/config get nodes
+kubectl --kubeconfig /home/<USER>/.kube/config -n kube-system \
+  get pods -l k8s-app=kube-dns
+kubectl --kubeconfig /home/<USER>/.kube/config -n private-apps \
+  get configmap grocery-collector-config \
+      secret grocery-collector-postal-code \
+      service proton-egress \
+      pvc grocery-output
+```
+
+Run the manual operator-test DAG with unique run IDs once with `worker`, once
+with `control-plane`, and optionally with `any`. For each run confirm:
+
+- the intended node and the exact digest-pinned image;
+- proxy egress succeeds and direct Internet fallback is blocked;
+- output is visible immediately at the unchanged control-plane path;
+- exactly one manifest and the expected JSON partitions exist before
+  `_SUCCESS` marks completion; and
+- unchanged dbt tasks discover the completed run while DuckDB remains local.
+
+Never launch the same location and run ID concurrently on two nodes.
+
+## Rollback
+
+Set `GROCERY_COLLECTION_OPERATOR=docker` and reparse/restart the Airflow
+components that load DAG environment. Do not copy, move, rewrite, or delete
+canonical data during rollback.
+
+
+================================================================================
+FILE: k8s/README.md
+================================================================================
+
+# Kubernetes runtime and shared storage
+
+## Canonical production output
+
+Production Docker collection writes the control-plane directory
+`/var/lib/grocery-sale-scraper`. The Kubernetes collector requires the
+`private-apps/grocery-output` PVC, whose tracked static PV mounts that exact
+directory from `192.0.2.10` over NFS. Both operators expose it as
+`/app/output`, so existing dbt input paths remain unchanged. On the production
+host the canonical directory is a persistent bind mount backed by
+`<GROCERY_STORAGE_BACKING_PATH>` on the secondary SSD.
+
+Before applying `grocery-output-storage.yaml`, perform these host operations:
+
+1. Install `nfs-kernel-server` and `nfs-common` on the control plane, and
+   `nfs-common` on every schedulable worker.
+2. Keep `/var/lib/grocery-sale-scraper` owned by UID/GID 1000 with mode 0750.
+3. Export that directory read-write with `sync`, `no_subtree_check`, and the
+   default `root_squash`, restricted to the control plane (`192.0.2.10`),
+   worker (`192.0.2.11`), and any future intended Tailscale node. A suitable
+   `/etc/exports.d/landing-zone.exports` entry is:
+
+   ```text
+   /var/lib/grocery-sale-scraper 192.0.2.10(rw,sync,no_subtree_check,root_squash) 192.0.2.11(rw,sync,no_subtree_check,root_squash)
+   ```
+
+   Do not use `no_root_squash`.
+4. Ensure TCP 2049 is permitted only between the intended nodes over the private
+   network. Restrict both the firewall rule and NFS export client list to those
+   nodes; do not expose NFS to the public Internet.
+5. Apply the manifest and require both objects to bind before selecting the
+   Kubernetes operator:
+
+```bash
+kubectl --kubeconfig /home/<USER>/.kube/config apply \
+  -f k8s/grocery-output-storage.yaml
+kubectl --kubeconfig /home/<USER>/.kube/config -n private-apps \
+  get pvc grocery-output
+```
+
+The PV uses `Retain`; deleting a Pod or PVC must not delete canonical data. Its
+50 GiB capacity is Kubernetes accounting metadata, not a quota on the exported
+filesystem. Back up and monitor `/srv/landing` separately. The complete shared
+storage topology is in `<STORAGE_RUNBOOK>`.
+
+Normal NFS `root_squash` prevents a root init container from changing ownership.
+The Pod therefore creates and removes a temporary probe file as UID/GID 1000 in
+one init container and configures the network kill switch in a separate
+`NET_ADMIN` init container. Pod-level `fsGroup` mutation is also omitted.
+Provision ownership on the NFS server rather than weakening export security.
+
+## Runtime configuration and centralized egress
+
+`grocery-collector-runtime.yaml` contains the non-secret collector ConfigMap
+and a headless `private-apps/proton-egress` Service/EndpointSlice. The latter
+maps the stable in-Pod name `proton-egress` to the centralized Proton proxy's
+Tailscale address. The postal code remains in the separately created Secret;
+neither configuration object is baked into the image.
+
+CoreDNS must be healthy before collection runs. The Pod's network kill switch
+allows UDP/TCP DNS to the resolver from `/etc/resolv.conf` and TCP to the
+configured proxy IP, then drops all other output. It does not use
+`hostAliases`.
+
+Node placement belongs to Airflow deployment configuration, not this storage
+manifest or the application image. Set `SCRAPER_KUBERNETES_PLACEMENT` (or the
+grocery-specific override) to `worker`, `control-plane`, or `any`; see the
+Airflow runbook for the exact scheduling rules.
+
+Do not apply the storage manifest before the NFS export exists: the PVC may bind,
+but Pods will remain in mount failure. Do not run Docker and Kubernetes
+collection concurrently with the same run ID.
+
+Use the manual Airflow operator-test DAG with a unique run ID for placement
+smoke tests. It exercises the production PVC, ConfigMap, Secret, image,
+command, proxy, and security policy instead of a node-local mirror.
+
+
+================================================================================
+FILE: k8s/airflow-kubernetes-operator-rbac.yaml
+================================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow-kubernetes-operator
+  namespace: private-apps
+  labels:
+    app.kubernetes.io/name: canadian-grocery-sale-scraper
+    app.kubernetes.io/component: airflow-control-plane
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-pod-launcher
+  namespace: private-apps
+  labels:
+    app.kubernetes.io/name: canadian-grocery-sale-scraper
+    app.kubernetes.io/component: airflow-control-plane
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-pod-launcher
+  namespace: private-apps
+  labels:
+    app.kubernetes.io/name: canadian-grocery-sale-scraper
+    app.kubernetes.io/component: airflow-control-plane
+subjects:
+  - kind: ServiceAccount
+    name: airflow-kubernetes-operator
+    namespace: private-apps
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: airflow-pod-launcher
+---
+# Airflow runs outside Kubernetes and cannot rotate a projected Pod token.
+# Keep this non-expiring credential only in Airflow's encrypted connection DB.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: airflow-kubernetes-operator-token
+  namespace: private-apps
+  labels:
+    app.kubernetes.io/name: canadian-grocery-sale-scraper
+    app.kubernetes.io/component: airflow-control-plane
+  annotations:
+    kubernetes.io/service-account.name: airflow-kubernetes-operator
+type: kubernetes.io/service-account-token
+
+
+================================================================================
+FILE: k8s/grocery-collector-runtime.yaml
+================================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grocery-collector-config
+  namespace: private-apps
+  labels:
+    app.kubernetes.io/name: canadian-grocery-sale-scraper
+    app.kubernetes.io/component: airflow-collector
+data:
+  config.toml: |
+    schema_version = 1
+    location_id = "home"
+    locale = "en-CA"
+    postal_code_file = "/run/secrets/postal-code"
+
+    selection_mode = "allowlist"
+    categories = ["Groceries"]
+    include_future = false
+    request_delay_seconds = 0.5
+
+    [http]
+    api_base = "https://backflipp.wishabi.com/flipp"
+    timeout_seconds = 30
+    max_attempts = 4
+    max_response_bytes = 52428800
+
+    [[merchants]]
+    id = "no-frills"
+    source_names = ["No Frills"]
+    required = false
+
+    [[merchants]]
+    id = "food-basics"
+    source_names = ["Food Basics"]
+    required = false
+
+    [[merchants]]
+    id = "freshco"
+    source_names = ["FreshCo"]
+    required = false
+
+    [[merchants]]
+    id = "walmart"
+    source_names = ["Walmart"]
+    required = false
+---
+# This headless Service gives Pods a stable name for the centralized Proton
+# proxy while resolving directly to the fail-closed Tailscale endpoint below.
+apiVersion: v1
+kind: Service
+metadata:
+  name: proton-egress
+  namespace: private-apps
+  labels:
+    app.kubernetes.io/name: proton-egress
+    app.kubernetes.io/component: centralized-proxy
+spec:
+  clusterIP: None
+  ports:
+    - name: http-connect
+      port: 8888
+      targetPort: 8888
+      protocol: TCP
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: proton-egress
+  namespace: private-apps
+  labels:
+    kubernetes.io/service-name: proton-egress
+    app.kubernetes.io/name: proton-egress
+    app.kubernetes.io/component: centralized-proxy
+addressType: IPv4
+ports:
+  - name: http-connect
+    protocol: TCP
+    port: 8888
+endpoints:
+  - addresses:
+      - 192.0.2.10
+    conditions:
+      ready: true
+
+
+================================================================================
+FILE: k8s/grocery-output-storage.yaml
+================================================================================
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: grocery-output
+  labels:
+    app.kubernetes.io/name: canadian-grocery-sale-scraper
+    app.kubernetes.io/component: collection-storage
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    - nfsvers=4.2
+    - hard
+    - noatime
+  nfs:
+    server: 192.0.2.10
+    path: /var/lib/grocery-sale-scraper
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grocery-output
+  namespace: private-apps
+  labels:
+    app.kubernetes.io/name: canadian-grocery-sale-scraper
+    app.kubernetes.io/component: collection-storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: ""
+  volumeName: grocery-output
+
+
+================================================================================
+FILE: orchestration/__init__.py
+================================================================================
+
+"""Deployment integrations for the grocery scraper."""
+
+
+================================================================================
+FILE: orchestration/airflow/README.md
+================================================================================
+
+# Airflow operator selection
+
+The data-only DAG uses `CANADIAN_GROCERY_SALE_SCRAPER_IMAGE` for both execution
+backends. Set `GROCERY_COLLECTION_OPERATOR` to `docker` (the default) or
+`kubernetes`. Only the selected operator is instantiated for a DAG parse.
+
+Install the providers in the Airflow image using `requirements.txt`, then place
+`grocery_collection_dag.py` and `grocery_collection_task.py` together in the
+Airflow DAG directory. The DAG is manual-only and has the distinct ID
+`grocery_collection_operator_test`, so installing it does not schedule or alter
+the existing production pipeline.
+
+For the production dag-factory pipeline, deploy `grocery_pipeline_loader.py`
+as `grocery_sale_pipeline.py` beside the existing
+`grocery_sale_pipeline.yml` and `grocery_collection_task.py`. The loader removes
+only the YAML collection task, rebuilds that task with the selected operator,
+and reconnects it to `refresh_grocery_views_before_enrichment`; every dbt,
+enrichment, notification, schedule, retry, and downstream dependency remains
+defined by the existing YAML.
+
+Always set `CANADIAN_GROCERY_SALE_SCRAPER_IMAGE` to an immutable, digest-pinned
+reference. The logical UTC timestamp is used as the run ID in both modes.
+
+The classification worker needs the enrichment dataset mounted twice from the
+same host source: writable at `/app/enrichment-output` for atomic run output,
+and read-only at `/var/lib/grocery-sale-enrichment` because dbt persists that
+canonical absolute path in its DuckDB file-backed classification views. If the
+read-only alias is absent, classification fails before Ollama with a DuckDB
+`No files found` error even when completed classification files exist on the
+host.
+
+## DockerOperator
+
+```text
+GROCERY_COLLECTION_OPERATOR=docker
+```
+
+Docker mode retains the current defaults: the `docker_registry` connection,
+the `proton-egress` internal network, and the three existing host bind mounts.
+The scheduler needs its existing Docker socket access.
+
+## KubernetesPodOperator
+
+Apply the non-secret runtime configuration and create the postal-code Secret:
+
+```bash
+kubectl --kubeconfig /home/<USER>/.kube/config apply \
+  -f k8s/grocery-collector-runtime.yaml
+kubectl --kubeconfig /home/<USER>/.kube/config apply \
+  -f k8s/grocery-output-storage.yaml
+kubectl --kubeconfig /home/<USER>/.kube/config -n private-apps \
+  create secret generic grocery-collector-postal-code \
+  --from-file=postal-code=/home/<USER>/.config/grocery-sale-scraper/postal-code \
+  --dry-run=client -o yaml | \
+kubectl --kubeconfig /home/<USER>/.kube/config apply -f -
+```
+
+Configure an Airflow Kubernetes connection that can create and monitor Pods in
+`private-apps`, then select it:
+
+```text
+GROCERY_COLLECTION_OPERATOR=kubernetes
+GROCERY_KUBERNETES_CONN_ID=kubernetes_default
+```
+
+Apply `k8s/airflow-kubernetes-operator-rbac.yaml` to create the external
+Airflow identity, namespace-scoped Pod/log/event permissions, and its manually
+managed service-account token. Airflow runs outside the cluster, so the token
+is non-expiring; store it only in the Fernet-encrypted Airflow connection and
+rotate it by replacing both the Secret and connection. The role deliberately
+omits Secret, ConfigMap, PVC, Job, node, and cluster-scoped API permissions.
+
+Kubernetes mode defaults to the `worker` placement and requires the
+`grocery-output` PVC. Placement is role-based rather than tied to a hostname:
+
+| Value | Scheduling rule |
+| --- | --- |
+| `worker` | Requires a node without the control-plane role; no control-plane toleration |
+| `control-plane` | Requires the control-plane role and tolerates only its `NoSchedule` taint |
+| `any` | Has no role constraint and carries that same narrow toleration |
+
+Set the shared `SCRAPER_KUBERNETES_PLACEMENT` variable or the grocery-specific
+`GROCERY_KUBERNETES_PLACEMENT` override. The latter takes precedence. The Pod
+has no node-local fallback: a missing or unbound claim prevents it from
+starting rather than writing data that downstream tasks cannot see. Set
+`GROCERY_KUBERNETES_OUTPUT_PVC` only when deploying the same storage contract
+under a different claim name.
+
+The tracked static PV maps the control-plane NFS export
+`192.0.2.10:/var/lib/grocery-sale-scraper` into the collector at
+`/app/output`. DockerOperator maps the local copy of that same directory to the
+same container path. See `k8s/README.md` for the required host packages, NFS
+export, firewall restriction, ownership, and verification steps. Those host
+operations are intentionally not performed by repository manifests.
+
+The Pod uses the `private-apps/registry-runner` service account for registry
+credentials but does not mount its API token. The runtime manifest also creates
+a headless `private-apps/proton-egress` Service whose EndpointSlice resolves to
+the centralized Tailscale proxy address. The fail-closed init container permits
+DNS plus TCP to that proxy address, then drops all other Pod egress. There is no
+hostname alias or node-local proxy dependency.
+
+Common overrides are available for the namespace, placement, ConfigMap, Secret,
+proxy endpoint, Docker paths/network, and Kubernetes PVC name; see
+`CollectionSettings.from_env` for their exact environment-variable names.
+
+
+================================================================================
+FILE: orchestration/airflow/__init__.py
+================================================================================
+
+"""Airflow task and DAG definitions."""
+
+
+================================================================================
+FILE: orchestration/airflow/grocery_collection_dag.py
+================================================================================
+
+"""Manual data-only DAG using the configured collection operator."""
+
+from datetime import datetime
+from pathlib import Path
+import sys
+from zoneinfo import ZoneInfo
+
+from airflow.sdk import DAG
+
+_DAG_DIRECTORY = Path(__file__).resolve().parent
+if str(_DAG_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(_DAG_DIRECTORY))
+
+from grocery_collection_task import build_collection_task
+
+
+with DAG(
+    dag_id="grocery_collection_operator_test",
+    description="Run the grocery collector through Docker or Kubernetes",
+    start_date=datetime(2026, 8, 25, tzinfo=ZoneInfo("America/Toronto")),
+    schedule=None,
+    catchup=False,
+    max_active_runs=1,
+    tags=["grocery", "collector", "operator-test"],
+) as dag:
+    build_collection_task()
+
+
+================================================================================
+FILE: orchestration/airflow/grocery_collection_task.py
+================================================================================
+
+"""Build the grocery collection task for Docker or KubernetesPodOperator."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any, Mapping
+
+
+# Manually triggered Airflow 3 DAG runs have no logical date.  Use their start
+# time in that case while keeping a stable logical-date-derived ID for retries
+# of scheduled runs.
+DEFAULT_RUN_ID = "{{ (dag_run.logical_date or dag_run.start_date).strftime('%Y%m%dT%H%M%SZ') }}"
+DEFAULT_KILLSWITCH_IMAGE = (
+    "qmcgaw/gluetun:v3.41.1@sha256:"
+    "1a5bf4b4820a879cdf8d93d7ef0d2d963af56670c9ebff8981860b6804ebc8ab"
+)
+PLACEMENTS = {"worker", "control-plane", "any"}
+CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
+
+
+@dataclass(frozen=True)
+class CollectionSettings:
+    operator: str
+    image: str
+    proxy_url: str
+    proxy_ip: str
+    proxy_port: int
+    docker_url: str
+    docker_conn_id: str
+    docker_network: str
+    docker_config_path: str
+    docker_postal_code_path: str
+    docker_output_path: str
+    kubernetes_conn_id: str
+    kubernetes_namespace: str
+    kubernetes_service_account: str
+    kubernetes_placement: str
+    kubernetes_config_map: str
+    kubernetes_postal_code_secret: str
+    kubernetes_output_pvc: str
+    killswitch_image: str
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> CollectionSettings:
+        values = os.environ if env is None else env
+        operator = values.get("GROCERY_COLLECTION_OPERATOR", "docker").lower()
+        if operator not in {"docker", "kubernetes"}:
+            raise ValueError(
+                "GROCERY_COLLECTION_OPERATOR must be 'docker' or 'kubernetes'"
+            )
+
+        kubernetes_placement = values.get(
+            "GROCERY_KUBERNETES_PLACEMENT",
+            values.get("SCRAPER_KUBERNETES_PLACEMENT", "worker"),
+        ).lower()
+        if kubernetes_placement not in PLACEMENTS:
+            raise ValueError(
+                "GROCERY_KUBERNETES_PLACEMENT must be 'worker', "
+                "'control-plane', or 'any'"
+            )
+
+        proxy_port = int(values.get("GROCERY_PROXY_PORT", "8888"))
+        if not 1 <= proxy_port <= 65535:
+            raise ValueError("GROCERY_PROXY_PORT must be between 1 and 65535")
+
+        output_pvc = values.get("GROCERY_KUBERNETES_OUTPUT_PVC") or "grocery-output"
+        return cls(
+            operator=operator,
+            image=values.get(
+                "CANADIAN_GROCERY_SALE_SCRAPER_IMAGE",
+                "canadian-grocery-sale-scraper:latest",
+            ),
+            proxy_url=values.get("GROCERY_PROXY_URL", "http://proton-egress:8888"),
+            proxy_ip=values.get("GROCERY_PROXY_IP", "192.0.2.10"),
+            proxy_port=proxy_port,
+            docker_url=values.get("GROCERY_DOCKER_URL", "unix://var/run/docker.sock"),
+            docker_conn_id=values.get(
+                "GROCERY_DOCKER_CONN_ID", "docker_registry"
+            ),
+            docker_network=values.get("GROCERY_DOCKER_NETWORK", "proton-egress"),
+            docker_config_path=values.get(
+                "GROCERY_DOCKER_CONFIG_PATH",
+                "/home/<USER>/projects/canadian-grocery-sale-scraper/config/config.toml",
+            ),
+            docker_postal_code_path=values.get(
+                "GROCERY_DOCKER_POSTAL_CODE_PATH",
+                "/home/<USER>/.config/grocery-sale-scraper/postal-code",
+            ),
+            docker_output_path=values.get(
+                "GROCERY_DOCKER_OUTPUT_PATH", "/var/lib/grocery-sale-scraper"
+            ),
+            kubernetes_conn_id=values.get(
+                "GROCERY_KUBERNETES_CONN_ID", "kubernetes_default"
+            ),
+            kubernetes_namespace=values.get(
+                "GROCERY_KUBERNETES_NAMESPACE", "private-apps"
+            ),
+            kubernetes_service_account=values.get(
+                "GROCERY_KUBERNETES_SERVICE_ACCOUNT", "registry-runner"
+            ),
+            kubernetes_placement=kubernetes_placement,
+            kubernetes_config_map=values.get(
+                "GROCERY_KUBERNETES_CONFIG_MAP", "grocery-collector-config"
+            ),
+            kubernetes_postal_code_secret=values.get(
+                "GROCERY_KUBERNETES_POSTAL_CODE_SECRET",
+                "grocery-collector-postal-code",
+            ),
+            kubernetes_output_pvc=output_pvc,
+            killswitch_image=values.get(
+                "GROCERY_KILLSWITCH_IMAGE", DEFAULT_KILLSWITCH_IMAGE
+            ),
+        )
+
+
+def proxy_environment(settings: CollectionSettings) -> dict[str, str]:
+    return {
+        "HTTP_PROXY": settings.proxy_url,
+        "HTTPS_PROXY": settings.proxy_url,
+        "http_proxy": settings.proxy_url,
+        "https_proxy": settings.proxy_url,
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1",
+    }
+
+
+def collection_arguments(run_id: str = DEFAULT_RUN_ID) -> list[str]:
+    return ["collect", "--config", "/run/config/config.toml", "--run-id", run_id]
+
+
+def kubernetes_placement_spec(placement: str) -> dict[str, Any]:
+    """Return scheduling fields for a role-based placement policy."""
+    if placement == "worker":
+        return {
+            "affinity": {
+                "nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [
+                            {
+                                "matchExpressions": [
+                                    {
+                                        "key": CONTROL_PLANE_LABEL,
+                                        "operator": "DoesNotExist",
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    control_plane_toleration = {
+        "key": CONTROL_PLANE_LABEL,
+        "operator": "Exists",
+        "effect": "NoSchedule",
+    }
+    if placement == "control-plane":
+        return {
+            "nodeSelector": {CONTROL_PLANE_LABEL: ""},
+            "tolerations": [control_plane_toleration],
+        }
+    if placement == "any":
+        return {"tolerations": [control_plane_toleration]}
+    raise ValueError(f"unsupported Kubernetes placement: {placement!r}")
+
+
+def kubernetes_pod_template(settings: CollectionSettings) -> dict[str, Any]:
+    output_volume: dict[str, Any] = {
+        "name": "output",
+        "persistentVolumeClaim": {"claimName": settings.kubernetes_output_pvc},
+    }
+
+    killswitch = "\n".join(
+        (
+            "dns_server=$(awk '/^nameserver / { print $2; exit }' /etc/resolv.conf)",
+            "test -n \"$dns_server\"",
+            "iptables -A OUTPUT -o lo -j ACCEPT",
+            "iptables -A OUTPUT -m conntrack --ctstate "
+            "ESTABLISHED,RELATED -j ACCEPT",
+            "iptables -A OUTPUT -p udp -d \"$dns_server\" --dport 53 -j ACCEPT",
+            "iptables -A OUTPUT -p tcp -d \"$dns_server\" --dport 53 -j ACCEPT",
+            f"iptables -A OUTPUT -p tcp -d {settings.proxy_ip} "
+            f"--dport {settings.proxy_port} -j ACCEPT",
+            "iptables -P OUTPUT DROP",
+        )
+    )
+
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "labels": {
+                "app.kubernetes.io/name": "canadian-grocery-sale-scraper",
+                "app.kubernetes.io/component": "airflow-collector",
+            }
+        },
+        "spec": {
+            "serviceAccountName": settings.kubernetes_service_account,
+            "automountServiceAccountToken": False,
+            "restartPolicy": "Never",
+            **kubernetes_placement_spec(settings.kubernetes_placement),
+            "initContainers": [
+                {
+                    "name": "verify-output-access",
+                    "image": settings.image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 1000,
+                        "runAsGroup": 1000,
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {"drop": ["ALL"]},
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "command": [
+                        "python",
+                        "-c",
+                        "import tempfile; tempfile.TemporaryFile(dir='/app/output').close()",
+                    ],
+                    "resources": {
+                        "requests": {
+                            "cpu": "10m",
+                            "memory": "16Mi",
+                            "ephemeral-storage": "8Mi",
+                        },
+                        "limits": {
+                            "cpu": "100m",
+                            "memory": "64Mi",
+                            "ephemeral-storage": "32Mi",
+                        },
+                    },
+                    "volumeMounts": [{"name": "output", "mountPath": "/app/output"}],
+                },
+                {
+                    "name": "configure-proton-egress",
+                    "image": settings.killswitch_image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "securityContext": {
+                        "runAsUser": 0,
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {
+                            "drop": ["ALL"],
+                            "add": ["NET_ADMIN"],
+                        },
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "command": ["/bin/sh", "-ec", killswitch],
+                    "resources": {
+                        "requests": {
+                            "cpu": "10m",
+                            "memory": "16Mi",
+                            "ephemeral-storage": "8Mi",
+                        },
+                        "limits": {
+                            "cpu": "100m",
+                            "memory": "64Mi",
+                            "ephemeral-storage": "32Mi",
+                        },
+                    },
+                    # iptables creates its userspace lock under /run. Keep the
+                    # image root read-only while giving only that runtime path
+                    # an ephemeral writable mount.
+                    "volumeMounts": [{"name": "run", "mountPath": "/run"}],
+                }
+            ],
+            "containers": [
+                {
+                    "name": "base",
+                    "image": settings.image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "env": [
+                        {"name": name, "value": value}
+                        for name, value in proxy_environment(settings).items()
+                    ],
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 1000,
+                        "runAsGroup": 1000,
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {"drop": ["ALL"]},
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "resources": {
+                        "requests": {
+                            "cpu": "50m",
+                            "memory": "64Mi",
+                            "ephemeral-storage": "64Mi",
+                        },
+                        "limits": {
+                            "cpu": "1",
+                            "memory": "256Mi",
+                            "ephemeral-storage": "256Mi",
+                        },
+                    },
+                    "volumeMounts": [
+                        {"name": "config", "mountPath": "/run/config", "readOnly": True},
+                        {"name": "postal-code", "mountPath": "/run/secrets", "readOnly": True},
+                        {"name": "output", "mountPath": "/app/output"},
+                        {"name": "tmp", "mountPath": "/tmp"},
+                    ],
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "config",
+                    "configMap": {"name": settings.kubernetes_config_map},
+                },
+                {
+                    "name": "postal-code",
+                    "secret": {
+                        "secretName": settings.kubernetes_postal_code_secret,
+                        # Secret volumes are root-owned unless a pod fsGroup is set.
+                        # Keep the read-only file accessible to the UID 1000 scraper
+                        # without applying fsGroup ownership changes to the NFS PVC.
+                        "defaultMode": 0o444,
+                    },
+                },
+                output_volume,
+                {"name": "tmp", "emptyDir": {"sizeLimit": "16Mi"}},
+                {"name": "run", "emptyDir": {"sizeLimit": "1Mi"}},
+            ],
+        },
+    }
+
+
+def build_collection_task(
+    *,
+    task_id: str = "collect_grocery_flyers",
+    run_id: str = DEFAULT_RUN_ID,
+    settings: CollectionSettings | None = None,
+    **operator_kwargs: Any,
+) -> Any:
+    """Return one Airflow operator selected by ``GROCERY_COLLECTION_OPERATOR``."""
+    selected = settings or CollectionSettings.from_env()
+    common = {
+        "task_id": task_id,
+        "do_xcom_push": False,
+        "execution_timeout": timedelta(hours=1),
+        **operator_kwargs,
+    }
+
+    if selected.operator == "docker":
+        from docker.types import Mount
+
+        from airflow.providers.docker.operators.docker import DockerOperator
+
+        return DockerOperator(
+            image=selected.image,
+            command=collection_arguments(run_id),
+            docker_url=selected.docker_url,
+            docker_conn_id=selected.docker_conn_id,
+            force_pull=True,
+            network_mode=selected.docker_network,
+            environment=proxy_environment(selected),
+            mount_tmp_dir=False,
+            mounts=[
+                Mount(
+                    target="/run/config/config.toml",
+                    source=selected.docker_config_path,
+                    type="bind",
+                    read_only=True,
+                ),
+                Mount(
+                    target="/run/secrets/postal-code",
+                    source=selected.docker_postal_code_path,
+                    type="bind",
+                    read_only=True,
+                ),
+                Mount(
+                    target="/app/output",
+                    source=selected.docker_output_path,
+                    type="bind",
+                ),
+            ],
+            auto_remove="success",
+            labels={
+                "app": "canadian-grocery-sale-scraper",
+                "stage": "collect",
+                "operator": "docker",
+            },
+            **common,
+        )
+
+    from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+
+    return KubernetesPodOperator(
+        name=task_id.replace("_", "-"),
+        namespace=selected.kubernetes_namespace,
+        image=selected.image,
+        arguments=collection_arguments(run_id),
+        kubernetes_conn_id=selected.kubernetes_conn_id,
+        pod_template_dict=kubernetes_pod_template(selected),
+        image_pull_policy="IfNotPresent",
+        get_logs=True,
+        log_events_on_failure=True,
+        on_finish_action="delete_pod",
+        startup_timeout_seconds=300,
+        **common,
+    )
+
+
+================================================================================
+FILE: orchestration/airflow/grocery_pipeline_loader.py
+================================================================================
+
+"""Load the production grocery pipeline with a selectable collection backend."""
+
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+from dagfactory import load_yaml_dags
+import yaml
+
+_DAG_DIRECTORY = Path(__file__).resolve().parent
+if str(_DAG_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(_DAG_DIRECTORY))
+
+from grocery_collection_task import build_collection_task
+
+# This import marker lets Airflow's safe-mode scanner discover the generated DAG.
+# from airflow import DAG
+
+_DAG_ID = "grocery_sale_pipeline_daily"
+_COLLECTION_TASK_ID = "collect_grocery_flyers"
+_COLLECTION_DOWNSTREAM_TASK_ID = "refresh_grocery_views_before_enrichment"
+_IMAGE_DEFAULTS = {
+    "CANADIAN_GROCERY_SALE_SCRAPER_IMAGE": "canadian-grocery-sale-scraper:latest",
+    "CANADIAN_GROCERY_SALE_WORKER_IMAGE": "canadian-grocery-sale-worker:latest",
+    "GZ_DBT_REPO_IMAGE": "gz-dbt-repo:latest",
+}
+
+
+def _render_config(config_path: Path) -> str:
+    config = config_path.read_text(encoding="utf-8")
+    for variable, default in _IMAGE_DEFAULTS.items():
+        config = config.replace(
+            f"${{{variable}}}",
+            os.environ.get(variable) or default,
+        )
+    return config
+
+
+def _without_collection_task(rendered_config: str) -> dict:
+    config = yaml.safe_load(rendered_config)
+    tasks = config[_DAG_ID]["tasks"]
+    collection_tasks = [
+        task for task in tasks if task.get("task_id") == _COLLECTION_TASK_ID
+    ]
+    if len(collection_tasks) != 1:
+        raise ValueError(
+            f"expected exactly one {_COLLECTION_TASK_ID!r} task in {_DAG_ID!r}"
+        )
+    config[_DAG_ID]["tasks"] = [
+        task for task in tasks if task.get("task_id") != _COLLECTION_TASK_ID
+    ]
+
+    downstream = next(
+        (
+            task
+            for task in config[_DAG_ID]["tasks"]
+            if task.get("task_id") == _COLLECTION_DOWNSTREAM_TASK_ID
+        ),
+        None,
+    )
+    if downstream is None:
+        raise ValueError(f"missing {_COLLECTION_DOWNSTREAM_TASK_ID!r} task")
+    dependencies = downstream.setdefault("dependencies", [])
+    if _COLLECTION_TASK_ID not in dependencies:
+        raise ValueError(
+            f"{_COLLECTION_DOWNSTREAM_TASK_ID!r} must depend on {_COLLECTION_TASK_ID!r}"
+        )
+    dependencies.remove(_COLLECTION_TASK_ID)
+    return config
+
+
+config_path = Path(__file__).with_name("grocery_sale_pipeline.yml")
+dag_config = _without_collection_task(_render_config(config_path))
+with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", encoding="utf-8") as config:
+    yaml.safe_dump(dag_config, config, sort_keys=False)
+    config.flush()
+    load_yaml_dags(
+        globals_dict=globals(),
+        config_filepath=config.name,
+    )
+
+production_dag = globals()[_DAG_ID]
+with production_dag:
+    collection_task = build_collection_task(task_id=_COLLECTION_TASK_ID)
+collection_task >> production_dag.get_task(_COLLECTION_DOWNSTREAM_TASK_ID)
+
+
+================================================================================
+FILE: orchestration/airflow/requirements.txt
+================================================================================
+
+apache-airflow-providers-docker==4.5.9
+apache-airflow-providers-cncf-kubernetes==10.21.0
+
+
+================================================================================
+FILE: pyproject.toml
+================================================================================
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canadian-grocery-sale-scraper"
+version = "0.2.0"
+description = "Configurable, containerized Canadian grocery flyer collector"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Private and proprietary"}
+dependencies = []
+
+[project.optional-dependencies]
+worker = ["duckdb==1.5.5"]
+
+[project.scripts]
+grocery-sales = "grocery_sale_scraper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+================================================================================
+FILE: requirements-worker.txt
+================================================================================
+
+duckdb==1.5.5
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/__init__.py
+================================================================================
+
+"""Canadian grocery flyer collector."""
+
+__version__ = "0.2.0"
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/__main__.py
+================================================================================
+
+from .cli import main
+
+
+raise SystemExit(main())
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/classification.py
+================================================================================
+
+"""Stable product-text keys and strict grocery classification responses."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import unicodedata
+from dataclasses import dataclass
+from typing import Any
+
+
+NORMALIZATION_VERSION = "product-text-v1"
+
+DEPARTMENTS = (
+    "produce",
+    "meat-seafood",
+    "dairy-eggs",
+    "bakery",
+    "deli-prepared",
+    "frozen",
+    "pantry",
+    "beverages",
+    "snacks-confectionery",
+    "household",
+    "personal-care",
+    "health-wellness",
+    "baby",
+    "pet",
+    "general-merchandise",
+    "non-product",
+    "unknown",
+)
+
+PROTEIN_TYPES = (
+    "beef",
+    "pork",
+    "chicken",
+    "turkey",
+    "lamb",
+    "fish",
+    "shellfish",
+    "mixed",
+    "other",
+)
+
+PRODUCT_FORMS = (
+    "fresh",
+    "frozen",
+    "deli",
+    "processed",
+    "prepared",
+    "canned",
+    "other",
+)
+
+CLASSIFICATION_STATUSES = ("classified", "non-product", "unknown")
+
+
+@dataclass(frozen=True)
+class ProductConcept:
+    classification_key: str
+    normalized_name: str
+    normalized_brand: str
+
+    def prompt_value(self) -> dict[str, str]:
+        return {
+            "classification_key": self.classification_key,
+            "name": self.normalized_name,
+            "brand": self.normalized_brand,
+        }
+
+
+def normalize_product_text(value: str | None) -> str:
+    """Normalize only representation, without trying to infer product identity."""
+    if value is None:
+        return ""
+    # This deliberately mirrors DuckDB's nfc_normalize + lower functions used
+    # by the dbt classification-key macro.
+    normalized = unicodedata.normalize("NFC", value).lower()
+    return " ".join(normalized.split())
+
+
+def product_classification_key(name: str | None, brand: str | None) -> str:
+    return normalized_product_classification_key(
+        normalize_product_text(name),
+        normalize_product_text(brand),
+    )
+
+
+def normalized_product_classification_key(
+    normalized_name: str,
+    normalized_brand: str,
+) -> str:
+    """Build a key from text already normalized by the dataset owner."""
+    parts = (NORMALIZATION_VERSION, normalized_name, normalized_brand)
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def output_schema() -> dict[str, Any]:
+    item = {
+        "type": "object",
+        "properties": {
+            "classification_key": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "canonical_label": {"type": ["string", "null"]},
+            "departments": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(DEPARTMENTS)},
+                "minItems": 1,
+                "uniqueItems": True,
+            },
+            "protein_types": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(PROTEIN_TYPES)},
+                "uniqueItems": True,
+            },
+            "product_forms": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(PRODUCT_FORMS)},
+                "uniqueItems": True,
+            },
+            "classification_status": {
+                "type": "string",
+                "enum": list(CLASSIFICATION_STATUSES),
+            },
+            "review_required": {"type": "boolean"},
+        },
+        "required": [
+            "classification_key",
+            "canonical_label",
+            "departments",
+            "protein_types",
+            "product_forms",
+            "classification_status",
+            "review_required",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": item,
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+
+def system_prompt() -> str:
+    schema = json.dumps(output_schema(), ensure_ascii=False, separators=(",", ":"))
+    return (
+        "Classify Canadian grocery flyer item text using only the supplied name and "
+        "brand. An offer may contain multiple products, so return every applicable "
+        "department. Use non-product for banners, navigation, or other records that "
+        "are not products. Use unknown rather than guessing. Protein types and product "
+        "forms apply only when supported by the text. Return exactly one result for "
+        "every input classification_key and never change a key. Output must match this "
+        f"JSON schema: {schema}"
+    )
+
+
+def validate_response(
+    value: Any,
+    concepts: list[ProductConcept],
+) -> list[dict[str, Any]]:
+    """Validate the semantic constraints not guaranteed by model JSON mode."""
+    if not isinstance(value, dict) or set(value) != {"items"}:
+        raise ValueError("classification response must contain only an items array")
+    items = value["items"]
+    if not isinstance(items, list):
+        raise ValueError("classification response items is not an array")
+
+    expected = {concept.classification_key for concept in concepts}
+    by_key: dict[str, dict[str, Any]] = {}
+    required = {
+        "classification_key",
+        "canonical_label",
+        "departments",
+        "protein_types",
+        "product_forms",
+        "classification_status",
+        "review_required",
+    }
+    for index, item in enumerate(items):
+        if not isinstance(item, dict) or set(item) != required:
+            raise ValueError(f"classification item {index} has unexpected fields")
+        key = item["classification_key"]
+        if len(concepts) == 1 and len(items) == 1 and isinstance(key, str):
+            # A singleton response is unambiguously associated with its sole
+            # input. Do not fail a long run only because the model rewrote the
+            # opaque correlation key; retain strict key matching for batches.
+            item = {**item, "classification_key": concepts[0].classification_key}
+            key = item["classification_key"]
+        if not isinstance(key, str) or key not in expected:
+            raise ValueError(f"classification item {index} has an unknown key")
+        if key in by_key:
+            raise ValueError(f"classification response duplicates key {key}")
+        label = item["canonical_label"]
+        if label is not None and (not isinstance(label, str) or not label.strip()):
+            raise ValueError(f"classification {key} has an invalid canonical label")
+        _validate_enum_list(item, "departments", DEPARTMENTS, required_nonempty=True)
+        _validate_enum_list(item, "protein_types", PROTEIN_TYPES)
+        _validate_enum_list(item, "product_forms", PRODUCT_FORMS)
+        status = item["classification_status"]
+        if status not in CLASSIFICATION_STATUSES:
+            raise ValueError(f"classification {key} has invalid status {status!r}")
+        if not isinstance(item["review_required"], bool):
+            raise ValueError(f"classification {key} review_required is not boolean")
+        if status == "non-product" and item["departments"] != ["non-product"]:
+            raise ValueError(f"classification {key} non-product department is inconsistent")
+        if status == "unknown" and item["departments"] != ["unknown"]:
+            raise ValueError(f"classification {key} unknown department is inconsistent")
+        by_key[key] = item
+
+    missing = expected - set(by_key)
+    if missing:
+        raise ValueError(f"classification response omitted {len(missing)} input keys")
+    if len(by_key) != len(concepts):
+        raise ValueError("classification response item count does not match input")
+    return [by_key[concept.classification_key] for concept in concepts]
+
+
+def _validate_enum_list(
+    item: dict[str, Any],
+    field: str,
+    allowed: tuple[str, ...],
+    *,
+    required_nonempty: bool = False,
+) -> None:
+    value = item[field]
+    key = item["classification_key"]
+    if not isinstance(value, list) or not all(isinstance(entry, str) for entry in value):
+        raise ValueError(f"classification {key} {field} is not a string array")
+    if required_nonempty and not value:
+        raise ValueError(f"classification {key} {field} is empty")
+    if len(value) != len(set(value)):
+        raise ValueError(f"classification {key} {field} contains duplicates")
+    unknown = set(value) - set(allowed)
+    if unknown:
+        raise ValueError(f"classification {key} {field} has unknown values")
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/cli.py
+================================================================================
+
+"""Command line interface for collection, enrichment, and egress checks."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Sequence
+
+from .config import HttpConfig, load_config
+from .flipp import (
+    discovery_records,
+    enriched_item,
+    fetch_flyer,
+    fetch_listing,
+    listing_flyers,
+    normalize_detail_items,
+    select_flyers,
+)
+from .http import fetch_json, utc_now
+from .enrichment import enrich_missing_concepts
+from .ollama import OllamaClient, OllamaConfig
+from .output import start_run
+
+
+DEFAULT_CONFIG = Path("/run/config/config.toml")
+DEFAULT_OUTPUT = Path("/app/output")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="grocery-sales",
+        description="Discover and preserve Canadian grocery flyer data.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    discover = commands.add_parser(
+        "discover", help="list merchants and flyers available for a postal code"
+    )
+    add_config_options(discover)
+    discover.add_argument("--json", action="store_true", help="emit structured JSON")
+    discover.add_argument(
+        "--all-categories",
+        action="store_true",
+        help="show non-matching categories in text output",
+    )
+
+    collect = commands.add_parser(
+        "collect", help="collect raw responses and enriched item records"
+    )
+    add_config_options(collect)
+    collect.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help="dedicated grocery dataset root (default: /app/output)",
+    )
+    collect.add_argument("--run-id", help="stable run identifier for scheduler retries")
+
+    enrich = commands.add_parser(
+        "enrich",
+        help="classify item concepts missing from the persistent enrichment dataset",
+    )
+    warm_ollama = commands.add_parser(
+        "warm-ollama",
+        help="load and retain the configured Ollama model before classification",
+    )
+    enrich.add_argument(
+        "--catalog-path",
+        type=Path,
+        default=Path("/var/lib/retail-sale-analytics/retail_sales.duckdb"),
+        help="DuckDB catalog containing the dbt missing-concepts view",
+    )
+    enrich.add_argument(
+        "--missing-view",
+        default="silver.slv_grocery_unclassified_concepts",
+        help="schema-qualified dbt view containing unclassified concepts",
+    )
+    enrich.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("/app/enrichment-output"),
+        help="classification dataset root",
+    )
+    enrich.add_argument(
+        "--source-run-id",
+        default=os.environ.get("GROCERY_SOURCE_RUN_ID"),
+    )
+    enrich.add_argument(
+        "--classifier-version",
+        default=os.environ.get("GROCERY_CLASSIFIER_VERSION", "grocery-v1"),
+    )
+    add_ollama_options(enrich)
+    enrich.add_argument("--batch-size", type=int, default=5)
+    enrich.add_argument("--validation-attempts", type=int, default=2)
+
+    add_ollama_options(warm_ollama)
+    warm_ollama.set_defaults(max_attempts=1)
+
+    egress = commands.add_parser("egress", help="show and optionally verify public egress")
+    egress.add_argument(
+        "--require-country",
+        help="exit nonzero unless ipinfo reports this two-letter country code",
+    )
+    return parser
+
+
+def add_config_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    postal = parser.add_mutually_exclusive_group()
+    postal.add_argument("--postal-code", help="override configured postal code")
+    postal.add_argument(
+        "--postal-code-file", type=Path, help="override configured postal-code file"
+    )
+
+
+def add_ollama_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ollama-url",
+        default=os.environ.get("OLLAMA_BASE_URL", "http://ollama:11434"),
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("OLLAMA_MODEL", "gemma4:26b-a4b-it-qat"),
+    )
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=int(os.environ.get("OLLAMA_CONTEXT_SIZE", "32768")),
+    )
+    parser.add_argument(
+        "--max-context-size",
+        type=int,
+        default=int(os.environ.get("OLLAMA_MAX_CONTEXT_SIZE", "131072")),
+    )
+    parser.add_argument("--timeout-seconds", type=float, default=600.0)
+    parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--keep-alive", default="10m")
+
+
+def command_discover(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    postal_code = config.resolve_postal_code(
+        override=args.postal_code,
+        override_file=args.postal_code_file,
+    )
+    document = fetch_listing(config, postal_code)
+    flyers = listing_flyers(document)
+    records = discovery_records(flyers, config)
+    if args.json:
+        print(json.dumps(records, ensure_ascii=False, indent=2))
+        return
+
+    visible = records if args.all_categories else [r for r in records if r["category_match"]]
+    if not visible:
+        print("No matching flyers found.")
+        return
+    print("SEL\tSTATE\tMERCHANT\tFLYER ID\tVALID TO\tNAME")
+    for record in visible:
+        marker = "yes" if record["selected"] else "-"
+        valid_to = str(record["valid_to"] or "")[:10]
+        print(
+            f"{marker}\t{record['state']}\t{record['merchant']}\t"
+            f"{record['flyer_id']}\t{valid_to}\t{record['name'] or ''}"
+        )
+
+
+def command_collect(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    postal_code = config.resolve_postal_code(
+        override=args.postal_code,
+        override_file=args.postal_code_file,
+    )
+    run = start_run(args.output_dir, config.location_id, args.run_id)
+    listing = fetch_listing(config, postal_code)
+    run.write_document(Path("raw/listing"), listing)
+    flyers = listing_flyers(listing)
+    records = discovery_records(flyers, config)
+    run.write_json(Path("selection/discovery.json"), records, kind="discovery")
+
+    selection = select_flyers(flyers, config)
+    if selection.missing_required_merchants:
+        missing = ", ".join(selection.missing_required_merchants)
+        raise RuntimeError(f"required merchants have no eligible flyer: {missing}")
+    if not selection.selected:
+        raise RuntimeError("configuration selected no eligible flyers")
+    run.write_json(
+        Path("selection/selected_flyers.json"),
+        [
+            {
+                "retailer_id": selected.retailer_id,
+                "source_merchant_name": selected.source_merchant_name,
+                "flyer_id": selected.flyer_id,
+                "source_flyer": selected.metadata,
+            }
+            for selected in selection.selected
+        ],
+        kind="selected_flyers",
+    )
+
+    observed_at = utc_now()
+    items_by_retailer: dict[str, list[dict]] = defaultdict(list)
+    warnings: list[str] = []
+    for selected in selection.selected:
+        document = fetch_flyer(config, postal_code, selected.flyer_id)
+        run.write_document(
+            Path(f"raw/flyers/flyer_id={selected.flyer_id}"), document
+        )
+        source_items = normalize_detail_items(document)
+        if not source_items:
+            warnings.append(f"flyer {selected.flyer_id} returned no items")
+        items_by_retailer[selected.retailer_id].extend(
+            enriched_item(
+                item,
+                selected,
+                location_id=config.location_id,
+                observed_at=observed_at,
+            )
+            for item in source_items
+        )
+
+    selected_retailers = {selected.retailer_id for selected in selection.selected}
+    for merchant in config.merchants:
+        if not merchant.required and merchant.id not in selected_retailers:
+            warnings.append(f"optional merchant {merchant.id} had no eligible flyer")
+
+    item_counts: dict[str, int] = {}
+    for retailer_id in sorted(items_by_retailer):
+        items = items_by_retailer[retailer_id]
+        run.write_json(
+            Path(f"normalized/retailer={retailer_id}/items.json"),
+            items,
+            kind="enriched_items",
+        )
+        item_counts[retailer_id] = len(items)
+
+    manifest_path = run.complete(
+        config,
+        postal_code=postal_code,
+        selected_flyers=selection.selected,
+        item_counts=item_counts,
+        warning_messages=warnings,
+    )
+    total = sum(item_counts.values())
+    print(
+        f"Completed run {run.run_id}: {len(selection.selected)} flyers, "
+        f"{total} item records; manifest {manifest_path}"
+    )
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def command_egress(args: argparse.Namespace) -> None:
+    document = fetch_json("https://ipinfo.io/json", HttpConfig())
+    country = str(document.value.get("country", "unknown")).upper()
+    print(f"IP: {document.value.get('ip', 'unknown')}")
+    print(f"Country: {country}")
+    print(f"Organization: {document.value.get('org', 'unknown')}")
+    if args.require_country and country != args.require_country.upper():
+        raise RuntimeError(
+            f"egress country {country!r} does not match required "
+            f"country {args.require_country.upper()!r}"
+        )
+
+
+def command_enrich(args: argparse.Namespace) -> None:
+    if not args.source_run_id:
+        raise ValueError("--source-run-id or GROCERY_SOURCE_RUN_ID is required")
+    _validate_ollama_options(args)
+    client = _ollama_client(args)
+    manifest, count = enrich_missing_concepts(
+        catalog_path=args.catalog_path,
+        missing_view=args.missing_view,
+        output_root=args.output_dir,
+        source_run_id=args.source_run_id,
+        classifier_version=args.classifier_version,
+        batch_size=args.batch_size,
+        client=client,
+        validation_attempts=args.validation_attempts,
+    )
+    print(
+        f"Completed classification for source run {args.source_run_id}: "
+        f"{count} concepts; manifest {manifest}"
+    )
+
+
+def command_warm_ollama(args: argparse.Namespace) -> None:
+    _validate_ollama_options(args)
+    client = _ollama_client(args)
+    response = client.warm_model()
+    total_duration = response.get("total_duration")
+    duration = (
+        f" in {total_duration / 1_000_000_000:.2f}s"
+        if isinstance(total_duration, int)
+        else ""
+    )
+    print(f"Warmed Ollama model {args.model}{duration}.")
+
+
+def _validate_ollama_options(args: argparse.Namespace) -> None:
+    if not args.ollama_url.startswith(("http://", "https://")):
+        raise ValueError("Ollama URL must use http:// or https://")
+    if args.timeout_seconds <= 0 or args.timeout_seconds > 1800:
+        raise ValueError("Ollama timeout must be between 0 and 1800 seconds")
+    if args.max_attempts < 1 or args.max_attempts > 10:
+        raise ValueError("Ollama max attempts must be between 1 and 10")
+    if args.context_size < 1 or args.context_size > 262_144:
+        raise ValueError("Ollama context size must be between 1 and 262144")
+    if args.max_context_size < args.context_size or args.max_context_size > 262_144:
+        raise ValueError(
+            "Ollama max context size must be between the base context size and 262144"
+        )
+
+
+def _ollama_client(args: argparse.Namespace) -> OllamaClient:
+    return OllamaClient(
+        OllamaConfig(
+            base_url=args.ollama_url,
+            model=args.model,
+            context_size=args.context_size,
+            max_context_size=args.max_context_size,
+            timeout_seconds=args.timeout_seconds,
+            max_attempts=args.max_attempts,
+            keep_alive=args.keep_alive,
+        )
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "discover":
+            command_discover(args)
+        elif args.command == "collect":
+            command_collect(args)
+        elif args.command == "egress":
+            command_egress(args)
+        elif args.command == "enrich":
+            command_enrich(args)
+        elif args.command == "warm-ollama":
+            command_warm_ollama(args)
+        else:  # pragma: no cover - argparse prevents this branch.
+            raise ValueError(f"unsupported command: {args.command}")
+        return 0
+    except (FileExistsError, OSError, RuntimeError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/config.py
+================================================================================
+
+"""Strict TOML configuration loading and Canadian postal-code handling."""
+
+from __future__ import annotations
+
+import re
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SAFE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+POSTAL_CODE_PATTERN = re.compile(r"^[A-Z]\d[A-Z]\d[A-Z]\d$")
+ROOT_KEYS = {
+    "schema_version",
+    "location_id",
+    "locale",
+    "postal_code",
+    "postal_code_file",
+    "selection_mode",
+    "categories",
+    "include_future",
+    "request_delay_seconds",
+    "http",
+    "merchants",
+}
+HTTP_KEYS = {
+    "api_base",
+    "timeout_seconds",
+    "max_attempts",
+    "max_response_bytes",
+}
+MERCHANT_KEYS = {
+    "id",
+    "source_names",
+    "required",
+    "include_flyer_name_patterns",
+    "exclude_flyer_name_patterns",
+}
+
+
+@dataclass(frozen=True)
+class HttpConfig:
+    api_base: str = "https://backflipp.wishabi.com/flipp"
+    timeout_seconds: float = 30.0
+    max_attempts: int = 4
+    max_response_bytes: int = 50 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class MerchantConfig:
+    id: str
+    source_names: tuple[str, ...]
+    required: bool = True
+    include_flyer_name_patterns: tuple[str, ...] = ()
+    exclude_flyer_name_patterns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScraperConfig:
+    schema_version: int
+    location_id: str
+    locale: str
+    postal_code: str | None
+    postal_code_file: Path | None
+    selection_mode: str
+    categories: tuple[str, ...]
+    include_future: bool
+    request_delay_seconds: float
+    http: HttpConfig
+    merchants: tuple[MerchantConfig, ...]
+
+    def resolve_postal_code(
+        self,
+        *,
+        override: str | None = None,
+        override_file: Path | None = None,
+    ) -> str:
+        """Resolve exactly one configured postal-code source, allowing CLI overrides."""
+        if override is not None and override_file is not None:
+            raise ValueError("--postal-code and --postal-code-file are mutually exclusive")
+        if override is not None:
+            return normalize_postal_code(override)
+        if override_file is not None:
+            return read_postal_code(override_file)
+        if self.postal_code is not None:
+            return normalize_postal_code(self.postal_code)
+        if self.postal_code_file is not None:
+            return read_postal_code(self.postal_code_file)
+        raise ValueError("postal_code or postal_code_file is required")
+
+
+def normalize_postal_code(value: str) -> str:
+    """Normalize a Canadian postal code to uppercase <REDACTED_POSTAL_CODE> form."""
+    normalized = re.sub(r"[\s-]+", "", value).upper()
+    if not POSTAL_CODE_PATTERN.fullmatch(normalized):
+        raise ValueError("postal code must use Canadian <REDACTED_POSTAL_CODE> format")
+    return normalized
+
+
+def read_postal_code(path: Path) -> str:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ValueError(f"could not read postal code file {path}: {error}") from error
+    return normalize_postal_code(value)
+
+
+def load_config(path: Path) -> ScraperConfig:
+    try:
+        with path.open("rb") as file:
+            data = tomllib.load(file)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"could not load configuration {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise ValueError("configuration root must be a TOML table")
+    _reject_unknown(data, ROOT_KEYS, "configuration")
+
+    schema_version = _integer(data, "schema_version", required=True)
+    if schema_version != 1:
+        raise ValueError(f"unsupported configuration schema_version: {schema_version}")
+
+    location_id = _string(data, "location_id", required=True)
+    if not SAFE_ID_PATTERN.fullmatch(location_id):
+        raise ValueError("location_id must contain lowercase letters, numbers, or hyphens")
+    locale = _string(data, "locale", default="en-CA")
+
+    postal_code = _optional_string(data, "postal_code")
+    raw_postal_file = _optional_string(data, "postal_code_file")
+    if postal_code is not None and raw_postal_file is not None:
+        raise ValueError("configure only one of postal_code or postal_code_file")
+    postal_code_file = None
+    if raw_postal_file is not None:
+        postal_code_file = Path(raw_postal_file)
+        if not postal_code_file.is_absolute():
+            postal_code_file = path.parent / postal_code_file
+
+    selection_mode = _string(data, "selection_mode", default="allowlist")
+    if selection_mode not in {"allowlist", "all_matching"}:
+        raise ValueError("selection_mode must be 'allowlist' or 'all_matching'")
+    categories = _string_tuple(data.get("categories", ["Groceries"]), "categories")
+    include_future = _boolean(data, "include_future", default=False)
+    request_delay = _number(data, "request_delay_seconds", default=0.5)
+    if request_delay < 0 or request_delay > 60:
+        raise ValueError("request_delay_seconds must be between 0 and 60")
+
+    http = _load_http(data.get("http", {}))
+    merchants = _load_merchants(data.get("merchants", []))
+    if selection_mode == "allowlist" and not merchants:
+        raise ValueError("allowlist selection requires at least one [[merchants]] entry")
+
+    return ScraperConfig(
+        schema_version=schema_version,
+        location_id=location_id,
+        locale=locale,
+        postal_code=postal_code,
+        postal_code_file=postal_code_file,
+        selection_mode=selection_mode,
+        categories=categories,
+        include_future=include_future,
+        request_delay_seconds=request_delay,
+        http=http,
+        merchants=merchants,
+    )
+
+
+def _load_http(value: Any) -> HttpConfig:
+    if not isinstance(value, dict):
+        raise ValueError("http must be a TOML table")
+    _reject_unknown(value, HTTP_KEYS, "http")
+    api_base = _string(value, "api_base", default=HttpConfig.api_base).rstrip("/")
+    if not api_base.startswith("https://"):
+        raise ValueError("http.api_base must use HTTPS")
+    timeout = _number(value, "timeout_seconds", default=30.0)
+    attempts = _integer(value, "max_attempts", default=4)
+    max_bytes = _integer(value, "max_response_bytes", default=50 * 1024 * 1024)
+    if timeout <= 0 or timeout > 300:
+        raise ValueError("http.timeout_seconds must be between 0 and 300")
+    if attempts < 1 or attempts > 10:
+        raise ValueError("http.max_attempts must be between 1 and 10")
+    if max_bytes < 1024 or max_bytes > 500 * 1024 * 1024:
+        raise ValueError("http.max_response_bytes must be between 1 KiB and 500 MiB")
+    return HttpConfig(api_base, timeout, attempts, max_bytes)
+
+
+def _load_merchants(value: Any) -> tuple[MerchantConfig, ...]:
+    if not isinstance(value, list):
+        raise ValueError("merchants must be an array of TOML tables")
+    merchants: list[MerchantConfig] = []
+    ids: set[str] = set()
+    aliases: dict[str, str] = {}
+    for index, raw in enumerate(value):
+        label = f"merchants[{index}]"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{label} must be a TOML table")
+        _reject_unknown(raw, MERCHANT_KEYS, label)
+        merchant_id = _string(raw, "id", required=True)
+        if not SAFE_ID_PATTERN.fullmatch(merchant_id):
+            raise ValueError(f"{label}.id must contain lowercase letters, numbers, or hyphens")
+        if merchant_id in ids:
+            raise ValueError(f"duplicate merchant id: {merchant_id}")
+        ids.add(merchant_id)
+        source_names = _string_tuple(raw.get("source_names"), f"{label}.source_names")
+        if not source_names:
+            raise ValueError(f"{label}.source_names must not be empty")
+        for source_name in source_names:
+            normalized = normalize_source_name(source_name)
+            if normalized in aliases:
+                raise ValueError(
+                    f"source name {source_name!r} is assigned to both "
+                    f"{aliases[normalized]!r} and {merchant_id!r}"
+                )
+            aliases[normalized] = merchant_id
+        include_patterns = _string_tuple(
+            raw.get("include_flyer_name_patterns", []),
+            f"{label}.include_flyer_name_patterns",
+        )
+        exclude_patterns = _string_tuple(
+            raw.get("exclude_flyer_name_patterns", []),
+            f"{label}.exclude_flyer_name_patterns",
+        )
+        for pattern in (*include_patterns, *exclude_patterns):
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"invalid flyer-name pattern {pattern!r}: {error}") from error
+        merchants.append(
+            MerchantConfig(
+                id=merchant_id,
+                source_names=source_names,
+                required=_boolean(raw, "required", default=True),
+                include_flyer_name_patterns=include_patterns,
+                exclude_flyer_name_patterns=exclude_patterns,
+            )
+        )
+    return tuple(merchants)
+
+
+def normalize_source_name(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _reject_unknown(value: dict[str, Any], allowed: set[str], label: str) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {label} fields: {', '.join(unknown)}")
+
+
+def _string(
+    value: dict[str, Any], key: str, *, required: bool = False, default: str = ""
+) -> str:
+    raw = value.get(key)
+    if raw is None:
+        if required:
+            raise ValueError(f"{key} is required")
+        return default
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    return raw.strip()
+
+
+def _optional_string(value: dict[str, Any], key: str) -> str | None:
+    if key not in value:
+        return None
+    return _string(value, key, required=True)
+
+
+def _integer(
+    value: dict[str, Any], key: str, *, required: bool = False, default: int = 0
+) -> int:
+    raw = value.get(key)
+    if raw is None:
+        if required:
+            raise ValueError(f"{key} is required")
+        return default
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        raise ValueError(f"{key} must be an integer")
+    return raw
+
+
+def _number(value: dict[str, Any], key: str, *, default: float) -> float:
+    raw = value.get(key, default)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        raise ValueError(f"{key} must be a number")
+    return float(raw)
+
+
+def _boolean(value: dict[str, Any], key: str, *, default: bool) -> bool:
+    raw = value.get(key, default)
+    if not isinstance(raw, bool):
+        raise ValueError(f"{key} must be true or false")
+    return raw
+
+
+def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{label} must be an array of strings")
+    cleaned = tuple(item.strip() for item in value if item.strip())
+    if len(cleaned) != len(value):
+        raise ValueError(f"{label} must not contain empty strings")
+    return cleaned
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/enrichment.py
+================================================================================
+
+"""Incremental Ollama classification over a dbt-owned missing-concepts view."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+from .classification import (
+    NORMALIZATION_VERSION,
+    ProductConcept,
+    normalized_product_classification_key,
+    output_schema,
+    system_prompt,
+    validate_response,
+)
+from .ollama import OllamaClient
+from .output import RUN_ID_PATTERN
+
+
+SAFE_VERSION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+QUALIFIED_VIEW_PATTERN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$"
+)
+
+
+@dataclass
+class ClassificationRunWriter:
+    directory: Path
+    files: dict[Path, dict[str, Any]] = field(default_factory=dict)
+
+    def write_json(self, relative_path: Path, value: Any, *, kind: str) -> None:
+        body = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        output_path = self.directory / relative_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(output_path.name + ".tmp")
+        temporary.write_bytes(body)
+        temporary.replace(output_path)
+        self.files[relative_path] = {
+            "path": relative_path.as_posix(),
+            "kind": kind,
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+    def register_existing(self, relative_path: Path, *, kind: str) -> None:
+        body = (self.directory / relative_path).read_bytes()
+        self.files[relative_path] = {
+            "path": relative_path.as_posix(),
+            "kind": kind,
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+    def complete(self, manifest: dict[str, Any]) -> Path:
+        manifest["files"] = [self.files[path] for path in sorted(self.files)]
+        self.write_json(Path("manifest.json"), manifest, kind="classification_manifest")
+        success = self.directory / "_SUCCESS"
+        temporary = success.with_name("_SUCCESS.tmp")
+        temporary.write_text("", encoding="utf-8")
+        temporary.replace(success)
+        return self.directory / "manifest.json"
+
+
+def load_missing_concepts(
+    catalog_path: Path,
+    view_name: str,
+    source_run_id: str,
+) -> list[ProductConcept]:
+    if not QUALIFIED_VIEW_PATTERN.fullmatch(view_name):
+        raise ValueError("missing-concepts view must be a schema-qualified SQL identifier")
+    try:
+        import duckdb  # type: ignore[import-not-found]
+    except ImportError as error:
+        raise RuntimeError("the enrichment worker requires the duckdb package") from error
+
+    try:
+        connection = duckdb.connect(str(catalog_path), read_only=True)
+        try:
+            rows = connection.execute(
+                f"""
+                select distinct
+                    classification_key,
+                    normalized_name,
+                    normalized_brand
+                from {view_name}
+                order by classification_key
+                """,
+            ).fetchall()
+        finally:
+            connection.close()
+    except Exception as error:
+        raise RuntimeError(
+            f"could not read missing concepts from {view_name}: {error}"
+        ) from error
+
+    concepts: list[ProductConcept] = []
+    for index, row in enumerate(rows):
+        key, name, brand = row
+        if not all(isinstance(value, str) for value in (key, name, brand)):
+            raise ValueError(f"missing-concepts row {index} contains non-string fields")
+        # These values have already been normalized by dbt. Hash them exactly:
+        # normalizing them again in Python can change Unicode whitespace that
+        # DuckDB deliberately preserved when it generated the key.
+        expected_key = normalized_product_classification_key(name, brand)
+        if key != expected_key:
+            raise ValueError(
+                f"missing-concepts row {index} classification key does not match "
+                f"normalization {NORMALIZATION_VERSION}"
+            )
+        concepts.append(ProductConcept(key, name, brand))
+    return concepts
+
+
+def enrich_missing_concepts(
+    *,
+    catalog_path: Path,
+    missing_view: str,
+    output_root: Path,
+    source_run_id: str,
+    classifier_version: str,
+    batch_size: int,
+    client: OllamaClient,
+    validation_attempts: int = 2,
+) -> tuple[Path, int]:
+    _validate_identifiers(source_run_id, classifier_version)
+    if batch_size < 1 or batch_size > 100:
+        raise ValueError("batch size must be between 1 and 100")
+    if validation_attempts < 1 or validation_attempts > 5:
+        raise ValueError("validation attempts must be between 1 and 5")
+
+    directory = (
+        output_root
+        / "dataset=item-classifications"
+        / f"classifier_version={classifier_version}"
+        / f"run_id={source_run_id}"
+    )
+    if (directory / "_SUCCESS").exists():
+        raise FileExistsError(
+            f"classification run {source_run_id!r} for {classifier_version!r} is complete"
+        )
+    directory.mkdir(parents=True, exist_ok=True)
+    run = ClassificationRunWriter(directory)
+
+    concepts = load_missing_concepts(catalog_path, missing_view, source_run_id)
+    prompt = system_prompt()
+    schema = output_schema()
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    model_digest: str | None = None
+    started_at = utc_iso()
+    records_by_key: dict[str, dict[str, Any]] = {}
+    missing_concepts: list[ProductConcept] = []
+
+    for concept in concepts:
+        relative_path = classification_record_path(concept.classification_key)
+        output_path = directory / relative_path
+        if not output_path.exists():
+            missing_concepts.append(concept)
+            continue
+        record = load_classification_record(
+            output_path,
+            concept=concept,
+            classifier_version=classifier_version,
+            source_run_id=source_run_id,
+            model_name=client.config.model,
+            prompt_sha256=prompt_sha256,
+        )
+        records_by_key[concept.classification_key] = record
+        run.register_existing(relative_path, kind="item_classification")
+
+    existing_digests = {
+        record["model_digest"] for record in records_by_key.values()
+    }
+    if len(existing_digests) > 1:
+        raise ValueError("existing classification files have inconsistent model digests")
+    existing_digest = next(iter(existing_digests), None)
+    if missing_concepts:
+        model_digest = client.model_digest()
+        if existing_digest is not None and model_digest != existing_digest:
+            raise ValueError(
+                "current Ollama model digest does not match existing classification files"
+            )
+    else:
+        model_digest = existing_digest
+
+    if records_by_key:
+        print(
+            f"Classification resume: found {len(records_by_key)} of "
+            f"{len(concepts)} validated classification files; "
+            f"{len(missing_concepts)} remain",
+            flush=True,
+        )
+
+    batch_count = (len(missing_concepts) + batch_size - 1) // batch_size
+    for batch_number, batch in enumerate(
+        batches(missing_concepts, batch_size), start=1
+    ):
+        request_prompt = json.dumps(
+            {"items": [concept.prompt_value() for concept in batch]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, validation_attempts + 1):
+            try:
+                value = client.chat(system=prompt, prompt=request_prompt, schema=schema)
+                validated = validate_response(value, batch)
+                break
+            except (RuntimeError, ValueError) as error:
+                last_error = error
+                if attempt == validation_attempts:
+                    raise RuntimeError(
+                        f"Ollama classification batch failed validation after "
+                        f"{validation_attempts} attempts: {error}"
+                    ) from error
+        else:  # pragma: no cover - the loop either breaks or raises.
+            raise RuntimeError(f"classification batch failed: {last_error}")
+
+        concepts_by_key = {concept.classification_key: concept for concept in batch}
+        classified_at = utc_iso()
+        for item in validated:
+            concept = concepts_by_key[item["classification_key"]]
+            record = {
+                "classification_record_schema_version": 1,
+                "classification_key": concept.classification_key,
+                "classifier_version": classifier_version,
+                "normalization_version": NORMALIZATION_VERSION,
+                "normalized_name": concept.normalized_name,
+                "normalized_brand": concept.normalized_brand,
+                **item,
+                "classification_source": "ollama",
+                "model_name": client.config.model,
+                "model_digest": model_digest,
+                "prompt_sha256": prompt_sha256,
+                "classified_at": classified_at,
+                "source_run_id": source_run_id,
+            }
+            relative_path = classification_record_path(concept.classification_key)
+            run.write_json(relative_path, record, kind="item_classification")
+            records_by_key[concept.classification_key] = record
+
+        print(
+            f"Classification progress: validated batch {batch_number}/{batch_count}; "
+            f"persisted {len(batch)} classifications; "
+            f"complete {len(records_by_key)}/{len(concepts)}",
+            flush=True,
+        )
+
+    records = [records_by_key[concept.classification_key] for concept in concepts]
+    run.write_json(Path("classifications.json"), records, kind="item_classifications")
+    manifest_path = run.complete(
+        {
+            "manifest_schema_version": 1,
+            "dataset": "item-classifications",
+            "source": "flipp-unofficial",
+            "source_run_id": source_run_id,
+            "classifier_version": classifier_version,
+            "normalization_version": NORMALIZATION_VERSION,
+            "model_name": client.config.model,
+            "model_digest": model_digest,
+            "prompt_sha256": prompt_sha256,
+            "started_at": min(
+                (record["classified_at"] for record in records),
+                default=started_at,
+            ),
+            "completed_at": utc_iso(),
+            "input_concept_count": len(concepts),
+            "classification_count": len(records),
+        }
+    )
+    return manifest_path, len(records)
+
+
+def classification_record_path(classification_key: str) -> Path:
+    return Path("classifications") / f"classification_key={classification_key}.json"
+
+
+def load_classification_record(
+    path: Path,
+    *,
+    concept: ProductConcept,
+    classifier_version: str,
+    source_run_id: str,
+    model_name: str,
+    prompt_sha256: str,
+) -> dict[str, Any]:
+    """Load and validate a durable per-key record before reusing it on retry."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"existing classification file {path} is invalid: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"existing classification file {path} is not a JSON object")
+
+    expected_metadata: dict[str, Any] = {
+        "classification_record_schema_version": 1,
+        "classification_key": concept.classification_key,
+        "classifier_version": classifier_version,
+        "normalization_version": NORMALIZATION_VERSION,
+        "normalized_name": concept.normalized_name,
+        "normalized_brand": concept.normalized_brand,
+        "classification_source": "ollama",
+        "model_name": model_name,
+        "prompt_sha256": prompt_sha256,
+        "source_run_id": source_run_id,
+    }
+    for field, expected in expected_metadata.items():
+        if value.get(field) != expected:
+            raise ValueError(
+                f"existing classification file {path} has mismatched {field}"
+            )
+    classified_at = value.get("classified_at")
+    if not isinstance(classified_at, str) or not classified_at:
+        raise ValueError(
+            f"existing classification file {path} has invalid classified_at"
+        )
+    model_digest = value.get("model_digest")
+    if not isinstance(model_digest, str) or not model_digest:
+        raise ValueError(
+            f"existing classification file {path} has invalid model_digest"
+        )
+
+    expected_fields = set(expected_metadata) | {
+        "model_digest",
+        "classified_at",
+        "canonical_label",
+        "departments",
+        "protein_types",
+        "product_forms",
+        "classification_status",
+        "review_required",
+    }
+    if set(value) != expected_fields:
+        raise ValueError(f"existing classification file {path} has unexpected fields")
+
+    classification_fields = {
+        field: value.get(field)
+        for field in (
+            "classification_key",
+            "canonical_label",
+            "departments",
+            "protein_types",
+            "product_forms",
+            "classification_status",
+            "review_required",
+        )
+    }
+    validate_response({"items": [classification_fields]}, [concept])
+    return value
+
+
+def batches(values: list[ProductConcept], size: int) -> Iterator[list[ProductConcept]]:
+    for offset in range(0, len(values), size):
+        yield values[offset : offset + size]
+
+
+def _validate_identifiers(source_run_id: str, classifier_version: str) -> None:
+    if not RUN_ID_PATTERN.fullmatch(source_run_id):
+        raise ValueError("source run ID contains unsafe characters")
+    if not SAFE_VERSION_PATTERN.fullmatch(classifier_version):
+        raise ValueError(
+            "classifier version must contain lowercase letters, numbers, dots, "
+            "underscores, or hyphens"
+        )
+
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/flipp.py
+================================================================================
+
+"""Unofficial Flipp endpoint client and deterministic flyer selection."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import urlencode
+
+from .config import MerchantConfig, ScraperConfig, normalize_source_name
+from .http import JsonDocument, fetch_json
+
+
+SOURCE_ID = "flipp-unofficial"
+
+
+@dataclass(frozen=True)
+class SelectedFlyer:
+    retailer_id: str
+    source_merchant_name: str
+    flyer_id: int
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SelectionResult:
+    selected: tuple[SelectedFlyer, ...]
+    missing_required_merchants: tuple[str, ...]
+
+
+def fetch_listing(config: ScraperConfig, postal_code: str) -> JsonDocument:
+    query = urlencode({"postal_code": postal_code, "locale": config.locale})
+    return fetch_json(f"{config.http.api_base}/flyers?{query}", config.http)
+
+
+def fetch_flyer(
+    config: ScraperConfig,
+    postal_code: str,
+    flyer_id: int,
+) -> JsonDocument:
+    if config.request_delay_seconds:
+        time.sleep(config.request_delay_seconds)
+    query = urlencode({"postal_code": postal_code, "locale": config.locale})
+    return fetch_json(
+        f"{config.http.api_base}/flyers/{flyer_id}?{query}",
+        config.http,
+    )
+
+
+def listing_flyers(document: JsonDocument) -> list[dict[str, Any]]:
+    flyers = document.value.get("flyers")
+    if not isinstance(flyers, list):
+        raise ValueError("listing response field 'flyers' is not an array")
+    checked: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for index, flyer in enumerate(flyers):
+        if not isinstance(flyer, dict):
+            raise ValueError(f"listing flyer at index {index} is not an object")
+        flyer_id = flyer.get("id")
+        merchant = flyer.get("merchant")
+        if not isinstance(flyer_id, int) or isinstance(flyer_id, bool):
+            raise ValueError(f"listing flyer at index {index} has no integer id")
+        if not isinstance(merchant, str) or not merchant.strip():
+            raise ValueError(f"listing flyer {flyer_id} has no merchant name")
+        if flyer_id in seen_ids:
+            raise ValueError(f"listing contains duplicate flyer id {flyer_id}")
+        seen_ids.add(flyer_id)
+        checked.append(flyer)
+    return checked
+
+
+def select_flyers(
+    flyers: list[dict[str, Any]],
+    config: ScraperConfig,
+    *,
+    observed_at: datetime | None = None,
+) -> SelectionResult:
+    now = observed_at or datetime.now(timezone.utc)
+    alias_map = {
+        normalize_source_name(alias): merchant
+        for merchant in config.merchants
+        for alias in merchant.source_names
+    }
+    selected: list[SelectedFlyer] = []
+    selected_retailers: set[str] = set()
+    all_matching_ids: dict[str, str] = {}
+
+    for flyer in flyers:
+        if not categories_match(flyer.get("categories"), config.categories):
+            continue
+        state = flyer_state(flyer, now)
+        if state == "expired" or (state == "future" and not config.include_future):
+            continue
+        source_name = " ".join(str(flyer["merchant"]).split())
+        merchant_config = alias_map.get(normalize_source_name(source_name))
+        if config.selection_mode == "allowlist":
+            if merchant_config is None or not _flyer_name_matches(flyer, merchant_config):
+                continue
+            retailer_id = merchant_config.id
+        else:
+            retailer_id = slugify(source_name)
+            normalized_name = normalize_source_name(source_name)
+            previous = all_matching_ids.setdefault(retailer_id, normalized_name)
+            if previous != normalized_name:
+                raise ValueError(
+                    f"all_matching generated colliding retailer id {retailer_id!r}; "
+                    "use allowlist mode"
+                )
+        selected.append(
+            SelectedFlyer(
+                retailer_id=retailer_id,
+                source_merchant_name=source_name,
+                flyer_id=int(flyer["id"]),
+                metadata=flyer,
+            )
+        )
+        selected_retailers.add(retailer_id)
+
+    selected.sort(key=lambda value: (value.retailer_id, value.flyer_id))
+    missing = tuple(
+        merchant.id
+        for merchant in config.merchants
+        if merchant.required and merchant.id not in selected_retailers
+    )
+    return SelectionResult(tuple(selected), missing)
+
+
+def discovery_records(
+    flyers: list[dict[str, Any]],
+    config: ScraperConfig,
+    *,
+    observed_at: datetime | None = None,
+) -> list[dict[str, Any]]:
+    now = observed_at or datetime.now(timezone.utc)
+    selection = select_flyers(flyers, config, observed_at=now)
+    selected_ids = {flyer.flyer_id: flyer.retailer_id for flyer in selection.selected}
+    records = []
+    for flyer in sorted(
+        flyers,
+        key=lambda value: (
+            normalize_source_name(str(value.get("merchant", ""))),
+            int(value["id"]),
+        ),
+    ):
+        records.append(
+            {
+                "selected": flyer["id"] in selected_ids,
+                "retailer_id": selected_ids.get(flyer["id"]),
+                "flyer_id": flyer["id"],
+                "merchant": " ".join(str(flyer["merchant"]).split()),
+                "name": flyer.get("name"),
+                "categories": normalized_categories(flyer.get("categories")),
+                "category_match": categories_match(
+                    flyer.get("categories"), config.categories
+                ),
+                "state": flyer_state(flyer, now),
+                "valid_from": flyer.get("valid_from"),
+                "valid_to": flyer.get("valid_to"),
+            }
+        )
+    return records
+
+
+def normalize_detail_items(document: JsonDocument) -> list[dict[str, Any]]:
+    items = document.value.get("items")
+    if not isinstance(items, list):
+        raise ValueError("flyer response field 'items' is not an array")
+    checked = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"flyer item at index {index} is not an object")
+        checked.append(item)
+    return checked
+
+
+def enriched_item(
+    item: dict[str, Any],
+    flyer: SelectedFlyer,
+    *,
+    location_id: str,
+    observed_at: str,
+) -> dict[str, Any]:
+    """Wrap known query fields around the untouched upstream item object."""
+    name = item.get("name")
+    brand = item.get("brand")
+    price = item.get("price")
+    fingerprint_parts = (
+        normalize_source_name(flyer.source_merchant_name),
+        normalize_source_name(name) if isinstance(name, str) else "",
+        normalize_source_name(brand) if isinstance(brand, str) else "",
+    )
+    fingerprint = hashlib.sha256("\x1f".join(fingerprint_parts).encode()).hexdigest()
+    return {
+        "record_schema_version": 1,
+        "source": SOURCE_ID,
+        "location_id": location_id,
+        "retailer_id": flyer.retailer_id,
+        "source_merchant_name": flyer.source_merchant_name,
+        "flyer_id": flyer.flyer_id,
+        "flyer_name": flyer.metadata.get("name"),
+        "flyer_categories": normalized_categories(flyer.metadata.get("categories")),
+        "flyer_valid_from": flyer.metadata.get("valid_from"),
+        "flyer_valid_to": flyer.metadata.get("valid_to"),
+        "observed_at": observed_at,
+        "item_id": item.get("id"),
+        "name": name,
+        "brand": brand,
+        "price": price,
+        "discount": item.get("discount"),
+        "valid_from": item.get("valid_from"),
+        "valid_to": item.get("valid_to"),
+        "available_to": item.get("available_to"),
+        "print_id": item.get("print_id"),
+        "cutout_image_url": item.get("cutout_image_url"),
+        "item_fingerprint": fingerprint,
+        "source_item": item,
+    }
+
+
+def normalized_categories(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return []
+
+
+def categories_match(value: Any, requested: tuple[str, ...]) -> bool:
+    if not requested:
+        return True
+    actual = {normalize_source_name(category) for category in normalized_categories(value)}
+    return any(normalize_source_name(category) in actual for category in requested)
+
+
+def flyer_state(flyer: dict[str, Any], now: datetime) -> str:
+    valid_from = _parse_timestamp(flyer.get("valid_from"), "valid_from", flyer["id"])
+    valid_to = _parse_timestamp(flyer.get("valid_to"), "valid_to", flyer["id"])
+    if valid_to is not None and valid_to < now:
+        return "expired"
+    if valid_from is not None and valid_from > now:
+        return "future"
+    return "active"
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+    if not slug:
+        slug = "merchant-" + hashlib.sha256(value.encode()).hexdigest()[:12]
+    return slug[:64].rstrip("-")
+
+
+def _flyer_name_matches(flyer: dict[str, Any], merchant: MerchantConfig) -> bool:
+    name = str(flyer.get("name") or "")
+    if merchant.include_flyer_name_patterns and not any(
+        re.search(pattern, name, flags=re.IGNORECASE)
+        for pattern in merchant.include_flyer_name_patterns
+    ):
+        return False
+    return not any(
+        re.search(pattern, name, flags=re.IGNORECASE)
+        for pattern in merchant.exclude_flyer_name_patterns
+    )
+
+
+def _parse_timestamp(value: Any, field: str, flyer_id: int) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"flyer {flyer_id} {field} is not a string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"flyer {flyer_id} has invalid {field}: {value!r}") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"flyer {flyer_id} {field} has no timezone offset")
+    return parsed
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/http.py
+================================================================================
+
+"""Bounded HTTP requests with transient retries and response preservation."""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.message import Message
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from .config import HttpConfig
+
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+)
+RESPONSE_HEADER_EXCLUSIONS = {"set-cookie", "set-cookie2"}
+
+
+@dataclass(frozen=True)
+class JsonDocument:
+    url: str
+    fetched_at: str
+    status: int
+    attempts: int
+    headers: dict[str, str]
+    body: bytes
+    value: dict[str, Any]
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def fetch_json(
+    url: str,
+    config: HttpConfig,
+    *,
+    opener: Callable[..., Any] = urlopen,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> JsonDocument:
+    """Fetch a JSON object, retaining the exact response bytes and safe headers."""
+    headers = {
+        "Accept": "application/json",
+        "Accept-Language": "en-CA,en;q=0.9",
+        "Referer": "https://flipp.com/",
+        "User-Agent": USER_AGENT,
+    }
+    last_error: Exception | None = None
+    for attempt in range(1, config.max_attempts + 1):
+        try:
+            request = Request(url, headers=headers)
+            with opener(request, timeout=config.timeout_seconds) as response:
+                status = int(response.status)
+                body = _read_bounded(response, config.max_response_bytes)
+                try:
+                    value = json.loads(body)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError(f"response is not valid UTF-8 JSON: {error}") from error
+                if not isinstance(value, dict):
+                    raise ValueError("response JSON root is not an object")
+                return JsonDocument(
+                    url=url,
+                    fetched_at=utc_now(),
+                    status=status,
+                    attempts=attempt,
+                    headers=_safe_headers(response.headers),
+                    body=body,
+                    value=value,
+                )
+        except HTTPError as error:
+            last_error = error
+            retryable = error.code == 429 or error.code >= 500
+            if not retryable or attempt == config.max_attempts:
+                detail = error.read(500).decode("utf-8", errors="replace")
+                raise RuntimeError(f"HTTP {error.code} from upstream: {detail}") from error
+            sleeper(_retry_delay(attempt, error.headers))
+        except (URLError, TimeoutError, OSError, ValueError) as error:
+            last_error = error
+            if attempt == config.max_attempts:
+                raise RuntimeError(f"could not fetch valid JSON: {error}") from error
+            sleeper(float(attempt))
+    raise RuntimeError(f"could not fetch JSON: {last_error}")
+
+
+def _read_bounded(response: Any, limit: int) -> bytes:
+    raw_length = response.headers.get("Content-Length")
+    if raw_length:
+        try:
+            if int(raw_length) > limit:
+                raise ValueError(f"response Content-Length exceeds {limit} bytes")
+        except ValueError as error:
+            if "exceeds" in str(error):
+                raise
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError(f"response exceeds {limit} bytes")
+    return body
+
+
+def _safe_headers(headers: Message) -> dict[str, str]:
+    return {
+        key.lower(): value
+        for key, value in headers.items()
+        if key.lower() not in RESPONSE_HEADER_EXCLUSIONS
+    }
+
+
+def _retry_delay(attempt: int, headers: Message | None) -> float:
+    if headers is not None:
+        value = headers.get("Retry-After")
+        if value:
+            try:
+                return min(max(float(value), 0.0), 60.0)
+            except ValueError:
+                pass
+    return float(attempt)
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/ollama.py
+================================================================================
+
+"""Small bounded Ollama API client for structured classification calls."""
+
+from __future__ import annotations
+
+import json
+import math
+import time
+from dataclasses import dataclass
+from email.message import Message
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+@dataclass(frozen=True)
+class OllamaConfig:
+    base_url: str
+    model: str
+    timeout_seconds: float = 600.0
+    max_attempts: int = 3
+    max_response_bytes: int = 8 * 1024 * 1024
+    keep_alive: str = "10m"
+    context_size: int = 32_768
+    max_context_size: int = 131_072
+
+
+class OllamaClient:
+    def __init__(
+        self,
+        config: OllamaConfig,
+        *,
+        opener: Callable[..., Any] = urlopen,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.config = config
+        self.opener = opener
+        self.sleeper = sleeper
+
+    def model_digest(self) -> str:
+        response = self._request("GET", "/api/tags")
+        models = response.get("models")
+        if not isinstance(models, list):
+            raise RuntimeError("Ollama tags response has no models array")
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            if model.get("name") == self.config.model or model.get("model") == self.config.model:
+                digest = model.get("digest")
+                if isinstance(digest, str) and digest:
+                    return digest
+                raise RuntimeError(f"Ollama model {self.config.model!r} has no digest")
+        raise RuntimeError(f"Ollama model {self.config.model!r} is not installed")
+
+    def warm_model(self) -> dict[str, Any]:
+        """Load the configured model and retain it for the configured keep-alive period."""
+        response = self._request(
+            "POST",
+            "/api/generate",
+            {
+                "model": self.config.model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": self.config.keep_alive,
+                "options": {"num_ctx": self.config.context_size},
+            },
+        )
+        if response.get("done") is not True:
+            raise RuntimeError("Ollama warm-up did not complete")
+        return response
+
+    def chat(self, *, system: str, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        context_size = self._context_size_for(system, prompt)
+        response = self._request(
+            "POST",
+            "/api/chat",
+            {
+                "model": self.config.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "format": schema,
+                "stream": False,
+                "keep_alive": self.config.keep_alive,
+                "options": {
+                    "temperature": 0,
+                    "num_ctx": context_size,
+                },
+            },
+        )
+        message = response.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            raise RuntimeError("Ollama chat response has no message content")
+        try:
+            value = json.loads(content)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Ollama message content is not JSON: {error}") from error
+        if not isinstance(value, dict):
+            raise RuntimeError("Ollama structured response root is not an object")
+        return value
+
+    def _context_size_for(self, system: str, prompt: str) -> int:
+        """Choose a bounded context window from a conservative request estimate."""
+        # Ollama does not expose a tokenizer-only API.  Estimating three bytes per
+        # token leaves headroom for the model's subword tokenization, then reserves
+        # 8k tokens for the JSON response.
+        estimated_input_tokens = math.ceil(
+            len((system + "\n" + prompt).encode("utf-8")) / 3
+        )
+        required_tokens = estimated_input_tokens + 8_192
+        context_size = self.config.context_size
+        while context_size < required_tokens and context_size < self.config.max_context_size:
+            context_size = min(context_size * 2, self.config.max_context_size)
+        return context_size
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        value: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = self.config.base_url.rstrip("/") + path
+        body = None if value is None else json.dumps(value).encode("utf-8")
+        headers = {"Accept": "application/json", "User-Agent": "grocery-sales-enricher/1"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        last_error: Exception | None = None
+        for attempt in range(1, self.config.max_attempts + 1):
+            try:
+                request = Request(url, data=body, headers=headers, method=method)
+                with self.opener(request, timeout=self.config.timeout_seconds) as response:
+                    payload = _read_bounded(response, self.config.max_response_bytes)
+                parsed = json.loads(payload)
+                if not isinstance(parsed, dict):
+                    raise ValueError("JSON root is not an object")
+                if isinstance(parsed.get("error"), str):
+                    raise RuntimeError(f"Ollama returned an error: {parsed['error']}")
+                return parsed
+            except HTTPError as error:
+                last_error = error
+                if (error.code != 429 and error.code < 500) or attempt == self.config.max_attempts:
+                    detail = error.read(500).decode("utf-8", errors="replace")
+                    raise RuntimeError(f"Ollama returned HTTP {error.code}: {detail}") from error
+                self.sleeper(_retry_delay(attempt, error.headers))
+            except (URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                last_error = error
+                if attempt == self.config.max_attempts:
+                    raise RuntimeError(f"could not receive valid JSON from Ollama: {error}") from error
+                self.sleeper(float(attempt))
+        raise RuntimeError(f"could not call Ollama: {last_error}")
+
+
+def _read_bounded(response: Any, limit: int) -> bytes:
+    raw_length = response.headers.get("Content-Length")
+    if raw_length:
+        try:
+            length = int(raw_length)
+        except ValueError:
+            length = -1
+        if length > limit:
+            raise ValueError(f"Ollama response Content-Length exceeds {limit} bytes")
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError(f"Ollama response exceeds {limit} bytes")
+    return body
+
+
+def _retry_delay(attempt: int, headers: Message | None) -> float:
+    if headers is not None:
+        value = headers.get("Retry-After")
+        if value:
+            try:
+                return min(max(float(value), 0.0), 60.0)
+            except ValueError:
+                pass
+    return float(attempt)
+
+
+================================================================================
+FILE: src/grocery_sale_scraper/output.py
+================================================================================
+
+"""Atomic run files, full-payload preservation, and completion manifests."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from . import __version__
+from .config import ScraperConfig
+from .flipp import SOURCE_ID, SelectedFlyer
+from .http import JsonDocument
+
+
+SUCCESS_MARKER = "_SUCCESS"
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+@dataclass
+class RunWriter:
+    directory: Path
+    run_id: str
+    started_at: str
+    files: dict[Path, dict[str, Any]] = field(default_factory=dict)
+
+    def write_document(self, relative_root: Path, document: JsonDocument) -> None:
+        payload_path = relative_root / "response.json"
+        metadata_path = relative_root / "request.json"
+        self.write_bytes(payload_path, document.body, kind="upstream_response")
+        self.write_json(
+            metadata_path,
+            {
+                "request_url": redact_postal_code(document.url),
+                "fetched_at": document.fetched_at,
+                "http_status": document.status,
+                "attempts": document.attempts,
+                "response_headers": document.headers,
+                "response_bytes": len(document.body),
+                "response_sha256": hashlib.sha256(document.body).hexdigest(),
+            },
+            kind="request_metadata",
+        )
+
+    def write_json(self, relative_path: Path, value: Any, *, kind: str) -> None:
+        body = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        self.write_bytes(relative_path, body, kind=kind)
+
+    def write_bytes(self, relative_path: Path, body: bytes, *, kind: str) -> None:
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(f"unsafe relative output path: {relative_path}")
+        output_path = self.directory / relative_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(output_path.name + ".tmp")
+        temporary.write_bytes(body)
+        temporary.replace(output_path)
+        self.files[relative_path] = {
+            "path": relative_path.as_posix(),
+            "kind": kind,
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+    def complete(
+        self,
+        config: ScraperConfig,
+        *,
+        postal_code: str,
+        selected_flyers: tuple[SelectedFlyer, ...],
+        item_counts: dict[str, int],
+        warning_messages: list[str],
+    ) -> Path:
+        manifest = {
+            "manifest_schema_version": 1,
+            "application_version": __version__,
+            "source": SOURCE_ID,
+            "run_id": self.run_id,
+            "started_at": self.started_at,
+            "completed_at": utc_iso(),
+            "location_id": config.location_id,
+            "postal_fsa": postal_code[:3],
+            "locale": config.locale,
+            "selection_mode": config.selection_mode,
+            "categories": list(config.categories),
+            "include_future": config.include_future,
+            "selected_flyers": [
+                {
+                    "retailer_id": flyer.retailer_id,
+                    "source_merchant_name": flyer.source_merchant_name,
+                    "flyer_id": flyer.flyer_id,
+                    "name": flyer.metadata.get("name"),
+                    "valid_from": flyer.metadata.get("valid_from"),
+                    "valid_to": flyer.metadata.get("valid_to"),
+                }
+                for flyer in selected_flyers
+            ],
+            "item_counts": dict(sorted(item_counts.items())),
+            "warnings": warning_messages,
+            "files": [self.files[path] for path in sorted(self.files)],
+        }
+        manifest_path = Path("manifest.json")
+        self.write_json(manifest_path, manifest, kind="manifest")
+        # The manifest deliberately lists data files but not itself or _SUCCESS.
+        success_path = self.directory / SUCCESS_MARKER
+        temporary = success_path.with_name(success_path.name + ".tmp")
+        temporary.write_text("", encoding="utf-8")
+        temporary.replace(success_path)
+        return self.directory / manifest_path
+
+
+def start_run(output_root: Path, location_id: str, run_id: str | None) -> RunWriter:
+    started_at = utc_iso()
+    selected_run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    if not RUN_ID_PATTERN.fullmatch(selected_run_id):
+        raise ValueError(
+            "run ID must be 1-128 characters containing letters, numbers, dots, "
+            "underscores, or hyphens"
+        )
+    directory = (
+        output_root
+        / f"source={SOURCE_ID}"
+        / f"location_id={location_id}"
+        / f"run_id={selected_run_id}"
+    )
+    if (directory / SUCCESS_MARKER).exists():
+        raise FileExistsError(f"run {selected_run_id!r} is already complete")
+    directory.mkdir(parents=True, exist_ok=True)
+    return RunWriter(directory, selected_run_id, started_at)
+
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def redact_postal_code(url: str) -> str:
+    parts = urlsplit(url)
+    query = [
+        (key, "<redacted>" if key == "postal_code" else value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+================================================================================
+FILE: tests/__init__.py
+================================================================================
+
+
+
+
+================================================================================
+FILE: tests/fixtures/flyer_101.json
+================================================================================
+
+{
+  "has_corrections": false,
+  "future_detail_field": ["retained", 42],
+  "pages": [
+    {"id": 501, "page_number": 1, "image_url": "https://example.invalid/page.jpg"}
+  ],
+  "items": [
+    {
+      "id": 1001,
+      "flyer_id": 101,
+      "name": "PINEAPPLE, each",
+      "brand": null,
+      "price": "3.99",
+      "discount": 20,
+      "valid_from": "2026-08-20T00:00:00-04:00",
+      "valid_to": "2026-08-26T23:59:59-04:00",
+      "available_to": "2026-08-26T23:59:59-04:00",
+      "print_id": "PINEAPPLE_EA",
+      "cutout_image_url": "https://example.invalid/pineapple.jpg",
+      "unknown_item_field": {"retained": true}
+    },
+    {
+      "id": 1002,
+      "flyer_id": 101,
+      "name": "NO NAME HONEY, 1 KG",
+      "brand": "no name",
+      "price": "",
+      "discount": null,
+      "unknown_item_field": "unpriced items are retained"
+    }
+  ]
+}
+
+
+================================================================================
+FILE: tests/fixtures/listing.json
+================================================================================
+
+{
+  "category_sort_csv": "Groceries,General Merchandise",
+  "refreshed_at": "2026-08-25T12:00:00-04:00",
+  "future_top_level_field": {"retained": true},
+  "flyers": [
+    {
+      "id": 101,
+      "merchant": "No Frills",
+      "name": "Weekly Flyer",
+      "categories": ["All Flyers", "Groceries"],
+      "valid_from": "2026-08-20T00:00:00-04:00",
+      "valid_to": "2026-08-26T23:59:59-04:00",
+      "unknown_flyer_field": "keep me"
+    },
+    {
+      "id": 102,
+      "merchant": "Walmart",
+      "name": "Next Weekly Flyer",
+      "categories": ["All Flyers", "Groceries"],
+      "valid_from": "2026-08-27T00:00:00-04:00",
+      "valid_to": "2026-09-02T23:59:59-04:00"
+    },
+    {
+      "id": 103,
+      "merchant": "Walmart",
+      "name": "Back to School",
+      "categories": ["General Merchandise"],
+      "valid_from": "2026-08-20T00:00:00-04:00",
+      "valid_to": "2026-08-30T23:59:59-04:00"
+    }
+  ]
+}
+
+
+================================================================================
+FILE: tests/test_airflow_collection_task.py
+================================================================================
+
+import unittest
+
+from orchestration.airflow.grocery_collection_task import (
+    CONTROL_PLANE_LABEL,
+    DEFAULT_RUN_ID,
+    CollectionSettings,
+    collection_arguments,
+    kubernetes_placement_spec,
+    kubernetes_pod_template,
+    proxy_environment,
+)
+
+
+class CollectionSettingsTests(unittest.TestCase):
+    def test_operator_must_be_supported(self) -> None:
+        with self.assertRaisesRegex(ValueError, "docker.*kubernetes"):
+            CollectionSettings.from_env({"GROCERY_COLLECTION_OPERATOR": "other"})
+
+    def test_operator_and_image_are_selected_from_environment(self) -> None:
+        settings = CollectionSettings.from_env(
+            {
+                "GROCERY_COLLECTION_OPERATOR": "KUBERNETES",
+                "CANADIAN_GROCERY_SALE_SCRAPER_IMAGE": "registry/app:v1@sha256:abc",
+            }
+        )
+        self.assertEqual(settings.operator, "kubernetes")
+        self.assertEqual(settings.image, "registry/app:v1@sha256:abc")
+
+    def test_proxy_port_is_validated(self) -> None:
+        with self.assertRaisesRegex(ValueError, "between 1 and 65535"):
+            CollectionSettings.from_env({"GROCERY_PROXY_PORT": "70000"})
+
+    def test_placement_must_be_supported(self) -> None:
+        with self.assertRaisesRegex(ValueError, "worker.*control-plane.*any"):
+            CollectionSettings.from_env(
+                {"GROCERY_KUBERNETES_PLACEMENT": "example-worker-node"}
+            )
+
+    def test_grocery_placement_overrides_shared_placement(self) -> None:
+        settings = CollectionSettings.from_env(
+            {
+                "SCRAPER_KUBERNETES_PLACEMENT": "any",
+                "GROCERY_KUBERNETES_PLACEMENT": "control-plane",
+            }
+        )
+        self.assertEqual(settings.kubernetes_placement, "control-plane")
+
+    def test_operator_defaults_share_the_canonical_output_contract(self) -> None:
+        settings = CollectionSettings.from_env({})
+        self.assertEqual(
+            settings.docker_output_path, "/var/lib/grocery-sale-scraper"
+        )
+        self.assertEqual(settings.kubernetes_output_pvc, "grocery-output")
+        self.assertEqual(settings.kubernetes_placement, "worker")
+
+
+class KubernetesPlacementTests(unittest.TestCase):
+    def test_worker_requires_absence_of_control_plane_role(self) -> None:
+        placement = kubernetes_placement_spec("worker")
+        self.assertNotIn("tolerations", placement)
+        self.assertEqual(
+            placement["affinity"]["nodeAffinity"]
+            ["requiredDuringSchedulingIgnoredDuringExecution"]
+            ["nodeSelectorTerms"][0]["matchExpressions"],
+            [{"key": CONTROL_PLANE_LABEL, "operator": "DoesNotExist"}],
+        )
+
+    def test_control_plane_requires_role_and_narrow_toleration(self) -> None:
+        placement = kubernetes_placement_spec("control-plane")
+        self.assertEqual(placement["nodeSelector"], {CONTROL_PLANE_LABEL: ""})
+        self.assertEqual(
+            placement["tolerations"],
+            [
+                {
+                    "key": CONTROL_PLANE_LABEL,
+                    "operator": "Exists",
+                    "effect": "NoSchedule",
+                }
+            ],
+        )
+
+    def test_any_has_no_required_role_and_tolerates_control_plane(self) -> None:
+        placement = kubernetes_placement_spec("any")
+        self.assertNotIn("nodeSelector", placement)
+        self.assertNotIn("affinity", placement)
+        self.assertEqual(placement["tolerations"][0]["key"], CONTROL_PLANE_LABEL)
+
+
+class OperatorSpecificationTests(unittest.TestCase):
+    def test_command_has_stable_scheduler_run_id(self) -> None:
+        self.assertEqual(
+            collection_arguments(),
+            ["collect", "--config", "/run/config/config.toml", "--run-id", DEFAULT_RUN_ID],
+        )
+
+    def test_kubernetes_template_uses_same_image_and_external_state(self) -> None:
+        settings = CollectionSettings.from_env(
+            {
+                "GROCERY_COLLECTION_OPERATOR": "kubernetes",
+                "CANADIAN_GROCERY_SALE_SCRAPER_IMAGE": "registry/app:v1@sha256:abc",
+            }
+        )
+        pod = kubernetes_pod_template(settings)
+        spec = pod["spec"]
+        self.assertEqual(spec["containers"][0]["image"], settings.image)
+        self.assertNotIn("nodeSelector", spec)
+        self.assertNotIn("hostAliases", spec)
+        self.assertNotIn("tolerations", spec)
+        self.assertFalse(spec["automountServiceAccountToken"])
+        self.assertEqual(spec["serviceAccountName"], "registry-runner")
+        self.assertEqual(
+            spec["volumes"][2],
+            {
+                "name": "output",
+                "persistentVolumeClaim": {"claimName": "grocery-output"},
+            },
+        )
+        self.assertEqual(spec["volumes"][1]["secret"]["defaultMode"], 0o444)
+        self.assertEqual(spec["initContainers"][0]["name"], "verify-output-access")
+        self.assertEqual(spec["initContainers"][0]["securityContext"]["runAsUser"], 1000)
+        self.assertEqual(spec["initContainers"][1]["name"], "configure-proton-egress")
+        self.assertEqual(
+            spec["initContainers"][1]["volumeMounts"],
+            [{"name": "run", "mountPath": "/run"}],
+        )
+        self.assertEqual(
+            spec["initContainers"][1]["securityContext"]["capabilities"]["add"],
+            ["NET_ADMIN"],
+        )
+        self.assertEqual(
+            dict(
+                (item["name"], item["value"])
+                for item in spec["containers"][0]["env"]
+            ),
+            proxy_environment(settings),
+        )
+        self.assertEqual(settings.proxy_url, "http://proton-egress:8888")
+        killswitch = spec["initContainers"][1]["command"][2]
+        self.assertIn("/etc/resolv.conf", killswitch)
+        self.assertIn("--dport 53", killswitch)
+        self.assertIn("192.0.2.10 --dport 8888", killswitch)
+        for container in [*spec["initContainers"], *spec["containers"]]:
+            self.assertIn("ephemeral-storage", container["resources"]["requests"])
+            self.assertIn("ephemeral-storage", container["resources"]["limits"])
+
+    def test_pvc_name_can_be_overridden(self) -> None:
+        settings = CollectionSettings.from_env(
+            {
+                "GROCERY_COLLECTION_OPERATOR": "kubernetes",
+                "GROCERY_KUBERNETES_OUTPUT_PVC": "grocery-data",
+            }
+        )
+        output = kubernetes_pod_template(settings)["spec"]["volumes"][2]
+        self.assertEqual(
+            output, {"name": "output", "persistentVolumeClaim": {"claimName": "grocery-data"}}
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+================================================================================
+FILE: tests/test_classification.py
+================================================================================
+
+import unittest
+
+from grocery_sale_scraper.classification import (
+    ProductConcept,
+    normalize_product_text,
+    product_classification_key,
+    validate_response,
+)
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_normalizes_representation_and_builds_stable_key(self):
+        self.assertEqual(normalize_product_text("  Crème\u00a0FRAÎCHE  "), "crème fraîche")
+        self.assertEqual(
+            product_classification_key("  BACON ", "Maple Leaf"),
+            product_classification_key("bacon", "maple  leaf"),
+        )
+        self.assertNotEqual(
+            product_classification_key("bacon", "Maple Leaf"),
+            product_classification_key("bacon", None),
+        )
+
+    def test_validates_exact_one_to_one_structured_response(self):
+        key = product_classification_key("Bacon", "Maple Leaf")
+        concept = ProductConcept(key, "bacon", "maple leaf")
+        value = {
+            "items": [
+                {
+                    "classification_key": key,
+                    "canonical_label": "Bacon",
+                    "departments": ["meat-seafood"],
+                    "protein_types": ["pork"],
+                    "product_forms": ["processed"],
+                    "classification_status": "classified",
+                    "review_required": False,
+                }
+            ]
+        }
+        self.assertEqual(validate_response(value, [concept]), value["items"])
+
+    def test_restores_rewritten_key_for_singleton_response(self):
+        key = product_classification_key("Bacon", "Maple Leaf")
+        concept = ProductConcept(key, "bacon", "maple leaf")
+        value = {
+            "items": [
+                {
+                    "classification_key": "0" * 64,
+                    "canonical_label": "Bacon",
+                    "departments": ["meat-seafood"],
+                    "protein_types": ["pork"],
+                    "product_forms": ["processed"],
+                    "classification_status": "classified",
+                    "review_required": False,
+                }
+            ]
+        }
+
+        result = validate_response(value, [concept])
+
+        self.assertEqual(result[0]["classification_key"], key)
+        self.assertEqual(value["items"][0]["classification_key"], "0" * 64)
+
+    def test_rejects_missing_or_inconsistent_results(self):
+        key = product_classification_key("Unknown", None)
+        concept = ProductConcept(key, "unknown", "")
+        value = {
+            "items": [
+                {
+                    "classification_key": key,
+                    "canonical_label": None,
+                    "departments": ["pantry"],
+                    "protein_types": [],
+                    "product_forms": [],
+                    "classification_status": "unknown",
+                    "review_required": True,
+                }
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "unknown department is inconsistent"):
+            validate_response(value, [concept])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+================================================================================
+FILE: tests/test_cli.py
+================================================================================
+
+import json
+from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+
+from grocery_sale_scraper.cli import main
+from grocery_sale_scraper.http import JsonDocument
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class FixtureDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        instant = cls.fromisoformat("2026-08-25T16:00:00+00:00")
+        return instant if tz is None else instant.astimezone(tz)
+
+
+def fixture_document(name: str, url: str) -> JsonDocument:
+    body = (FIXTURES / name).read_bytes()
+    return JsonDocument(
+        url=url,
+        fetched_at="2026-08-25T16:00:00Z",
+        status=200,
+        attempts=1,
+        headers={"content-type": "application/json"},
+        body=body,
+        value=json.loads(body),
+    )
+
+
+class CliTests(unittest.TestCase):
+    def test_collect_writes_isolated_complete_raw_and_enriched_run(self):
+        config_text = """
+schema_version = 1
+location_id = "test-home"
+postal_code = "<REDACTED_POSTAL_CODE>"
+selection_mode = "allowlist"
+categories = ["Groceries"]
+include_future = false
+request_delay_seconds = 0
+
+[[merchants]]
+id = "no-frills"
+source_names = ["No Frills"]
+required = true
+"""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.toml"
+            config.write_text(config_text, encoding="utf-8")
+            listing = fixture_document(
+                "listing.json",
+                "https://example.invalid/flyers?postal_code=<REDACTED_POSTAL_CODE>&locale=en-CA",
+            )
+            detail = fixture_document(
+                "flyer_101.json",
+                "https://example.invalid/flyers/101?postal_code=<REDACTED_POSTAL_CODE>&locale=en-CA",
+            )
+            with (
+                patch("grocery_sale_scraper.cli.fetch_listing", return_value=listing),
+                patch("grocery_sale_scraper.cli.fetch_flyer", return_value=detail),
+                patch("grocery_sale_scraper.flipp.datetime", FixtureDateTime),
+            ):
+                status = main(
+                    [
+                        "collect",
+                        "--config",
+                        str(config),
+                        "--output-dir",
+                        str(root / "output"),
+                        "--run-id",
+                        "fixture-run",
+                    ]
+                )
+
+            run = (
+                root
+                / "output"
+                / "source=flipp-unofficial"
+                / "location_id=test-home"
+                / "run_id=fixture-run"
+            )
+            self.assertEqual(status, 0)
+            self.assertTrue((run / "_SUCCESS").is_file())
+            self.assertEqual((run / "raw/listing/response.json").read_bytes(), listing.body)
+            request = json.loads((run / "raw/listing/request.json").read_text())
+            self.assertIn("postal_code=%3Credacted%3E", request["request_url"])
+            items = json.loads(
+                (run / "normalized/retailer=no-frills/items.json").read_text()
+            )
+            self.assertEqual(len(items), 2)
+            self.assertEqual(
+                items[1]["source_item"]["unknown_item_field"],
+                "unpriced items are retained",
+            )
+            manifest = json.loads((run / "manifest.json").read_text())
+            self.assertEqual(manifest["postal_fsa"], "A1A")
+            self.assertEqual(manifest["item_counts"], {"no-frills": 2})
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+================================================================================
+FILE: tests/test_config.py
+================================================================================
+
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+
+from grocery_sale_scraper.config import load_config, normalize_postal_code
+
+
+VALID_CONFIG = """
+schema_version = 1
+location_id = "home"
+locale = "en-CA"
+postal_code = "<REDACTED_POSTAL_CODE>"
+selection_mode = "allowlist"
+categories = ["Groceries"]
+include_future = false
+request_delay_seconds = 0
+
+[http]
+max_attempts = 2
+
+[[merchants]]
+id = "no-frills"
+source_names = ["No Frills"]
+required = true
+"""
+
+
+class ConfigTests(unittest.TestCase):
+    def test_loads_and_resolves_postal_code(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(VALID_CONFIG, encoding="utf-8")
+            config = load_config(path)
+
+        self.assertEqual(config.location_id, "home")
+        self.assertEqual(config.resolve_postal_code(), "<REDACTED_POSTAL_CODE>")
+        self.assertEqual(config.merchants[0].id, "no-frills")
+        self.assertEqual(config.http.max_attempts, 2)
+
+    def test_rejects_unknown_fields(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(VALID_CONFIG + "\ntypo_field = true\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unknown .* fields"):
+                load_config(path)
+
+    def test_normalizes_common_postal_formats(self):
+        self.assertEqual(normalize_postal_code("a1a-1a1"), "<REDACTED_POSTAL_CODE>")
+        with self.assertRaisesRegex(ValueError, "<REDACTED_POSTAL_CODE>"):
+            normalize_postal_code("12345")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+================================================================================
+FILE: tests/test_enrichment.py
+================================================================================
+
+import json
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+from unittest.mock import MagicMock, patch
+
+from grocery_sale_scraper.classification import ProductConcept, product_classification_key
+from grocery_sale_scraper.enrichment import enrich_missing_concepts, load_missing_concepts
+
+
+class FakeOllamaClient:
+    def __init__(self):
+        self.config = SimpleNamespace(model="test-model")
+        self.chat_calls = 0
+
+    def model_digest(self):
+        return "abc123"
+
+    def chat(self, *, system, prompt, schema):
+        self.chat_calls += 1
+        request = json.loads(prompt)
+        return {
+            "items": [
+                {
+                    "classification_key": item["classification_key"],
+                    "canonical_label": item["name"].title(),
+                    "departments": ["meat-seafood"],
+                    "protein_types": ["pork"],
+                    "product_forms": ["fresh"],
+                    "classification_status": "classified",
+                    "review_required": False,
+                }
+                for item in request["items"]
+            ]
+        }
+
+
+class FailingOllamaClient(FakeOllamaClient):
+    def __init__(self, fail_on_call):
+        super().__init__()
+        self.fail_on_call = fail_on_call
+        self.requested_keys = []
+
+    def chat(self, *, system, prompt, schema):
+        request = json.loads(prompt)
+        self.requested_keys.extend(
+            item["classification_key"] for item in request["items"]
+        )
+        if self.chat_calls + 1 == self.fail_on_call:
+            self.chat_calls += 1
+            raise RuntimeError("simulated interruption")
+        return super().chat(system=system, prompt=prompt, schema=schema)
+
+
+class EnrichmentTests(unittest.TestCase):
+    def test_loads_dbt_normalized_concept_with_preserved_non_breaking_space(self):
+        name = "tim hortons ground coffee 825 - 875\N{NO-BREAK SPACE}g coffee capsules 30's"
+        brand = "tim horton's"
+        key = "66887d6208698813c26d4a5e54e33cefeb81b182726426a72c59350e264e903e"
+        connection = MagicMock()
+        connection.execute.return_value.fetchall.return_value = [(key, name, brand)]
+        duckdb = SimpleNamespace(connect=MagicMock(return_value=connection))
+
+        with patch.dict("sys.modules", {"duckdb": duckdb}):
+            concepts = load_missing_concepts(
+                Path("catalog.duckdb"),
+                "silver.slv_grocery_unclassified_concepts",
+                "fixture-run",
+            )
+
+        self.assertEqual(concepts, [ProductConcept(key, name, brand)])
+        query = connection.execute.call_args.args[0]
+        self.assertNotIn("source_run_id = ?", query)
+        self.assertEqual(len(connection.execute.call_args.args), 1)
+        connection.close.assert_called_once_with()
+
+    def test_writes_atomic_per_key_records_then_consolidates_and_completes(self):
+        concepts = [
+            ProductConcept(
+                product_classification_key("Pork chops", ""),
+                "pork chops",
+                "",
+            ),
+            ProductConcept(
+                product_classification_key("Bacon", "Maple Leaf"),
+                "bacon",
+                "maple leaf",
+            ),
+        ]
+        client = FakeOllamaClient()
+        with TemporaryDirectory() as directory, patch(
+            "grocery_sale_scraper.enrichment.load_missing_concepts",
+            return_value=concepts,
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                manifest_path, count = enrich_missing_concepts(
+                    catalog_path=Path("unused.duckdb"),
+                    missing_view="silver.missing",
+                    output_root=Path(directory),
+                    source_run_id="fixture-run",
+                    classifier_version="grocery-v1",
+                    batch_size=1,
+                    client=client,
+                )
+            run = manifest_path.parent
+            records = json.loads((run / "classifications.json").read_text())
+            manifest = json.loads(manifest_path.read_text())
+
+            self.assertEqual(count, 2)
+            self.assertEqual(client.chat_calls, 2)
+            self.assertTrue((run / "_SUCCESS").is_file())
+            self.assertEqual(len(records), 2)
+            per_key_files = sorted((run / "classifications").glob("*.json"))
+            self.assertEqual(len(per_key_files), 2)
+            self.assertEqual(
+                {
+                    record["classification_key"]: record
+                    for record in (
+                        json.loads(path.read_text()) for path in per_key_files
+                    )
+                },
+                {record["classification_key"]: record for record in records},
+            )
+            self.assertNotIn("price", records[0])
+            self.assertEqual(manifest["classification_count"], 2)
+            self.assertEqual(manifest["model_digest"], "abc123")
+            self.assertEqual(
+                [entry["kind"] for entry in manifest["files"]].count(
+                    "item_classification"
+                ),
+                2,
+            )
+            self.assertEqual(output.getvalue().count("Classification progress:"), 2)
+
+    def test_retry_skips_existing_key_files_and_classifies_only_missing(self):
+        concepts = [
+            ProductConcept(product_classification_key(name, ""), name.lower(), "")
+            for name in ("Pork chops", "Bacon")
+        ]
+        with TemporaryDirectory() as directory, patch(
+            "grocery_sale_scraper.enrichment.load_missing_concepts",
+            return_value=concepts,
+        ):
+            first_client = FailingOllamaClient(fail_on_call=2)
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                enrich_missing_concepts(
+                    catalog_path=Path("unused.duckdb"),
+                    missing_view="silver.missing",
+                    output_root=Path(directory),
+                    source_run_id="retry-run",
+                    classifier_version="grocery-v1",
+                    batch_size=1,
+                    client=first_client,
+                    validation_attempts=1,
+                )
+
+            run = (
+                Path(directory)
+                / "dataset=item-classifications"
+                / "classifier_version=grocery-v1"
+                / "run_id=retry-run"
+            )
+            self.assertEqual(len(list((run / "classifications").glob("*.json"))), 1)
+            self.assertFalse((run / "classifications.json").exists())
+            self.assertFalse((run / "manifest.json").exists())
+            self.assertFalse((run / "_SUCCESS").exists())
+
+            retry_client = FailingOllamaClient(fail_on_call=99)
+            manifest_path, count = enrich_missing_concepts(
+                catalog_path=Path("unused.duckdb"),
+                missing_view="silver.missing",
+                output_root=Path(directory),
+                source_run_id="retry-run",
+                classifier_version="grocery-v1",
+                batch_size=1,
+                client=retry_client,
+                validation_attempts=1,
+            )
+
+            self.assertEqual(
+                retry_client.requested_keys, [concepts[1].classification_key]
+            )
+            self.assertEqual(count, 2)
+            self.assertEqual(
+                len(json.loads((run / "classifications.json").read_text())), 2
+            )
+            self.assertTrue(manifest_path.is_file())
+            self.assertTrue((run / "_SUCCESS").is_file())
+
+    def test_retry_rejects_mismatched_existing_key_file(self):
+        concept = ProductConcept(
+            product_classification_key("Pork chops", ""), "pork chops", ""
+        )
+        with TemporaryDirectory() as directory, patch(
+            "grocery_sale_scraper.enrichment.load_missing_concepts",
+            return_value=[concept],
+        ):
+            manifest_path, _ = enrich_missing_concepts(
+                catalog_path=Path("unused.duckdb"),
+                missing_view="silver.missing",
+                output_root=Path(directory),
+                source_run_id="corrupt-run",
+                classifier_version="grocery-v1",
+                batch_size=1,
+                client=FakeOllamaClient(),
+            )
+            run = manifest_path.parent
+            (run / "_SUCCESS").unlink()
+            per_key_path = next((run / "classifications").glob("*.json"))
+            record = json.loads(per_key_path.read_text())
+            record["source_run_id"] = "some-other-run"
+            per_key_path.write_text(json.dumps(record))
+
+            with self.assertRaisesRegex(ValueError, "mismatched source_run_id"):
+                enrich_missing_concepts(
+                    catalog_path=Path("unused.duckdb"),
+                    missing_view="silver.missing",
+                    output_root=Path(directory),
+                    source_run_id="corrupt-run",
+                    classifier_version="grocery-v1",
+                    batch_size=1,
+                    client=FakeOllamaClient(),
+                )
+
+    def test_retry_with_every_key_persisted_does_not_call_ollama(self):
+        concept = ProductConcept(
+            product_classification_key("Pork chops", ""), "pork chops", ""
+        )
+        with TemporaryDirectory() as directory, patch(
+            "grocery_sale_scraper.enrichment.load_missing_concepts",
+            return_value=[concept],
+        ):
+            manifest_path, _ = enrich_missing_concepts(
+                catalog_path=Path("unused.duckdb"),
+                missing_view="silver.missing",
+                output_root=Path(directory),
+                source_run_id="all-persisted-run",
+                classifier_version="grocery-v1",
+                batch_size=1,
+                client=FakeOllamaClient(),
+            )
+            (manifest_path.parent / "_SUCCESS").unlink()
+
+            retry_client = FakeOllamaClient()
+            retry_client.model_digest = unittest.mock.Mock(
+                side_effect=AssertionError("not called")
+            )
+            retry_client.chat = unittest.mock.Mock(
+                side_effect=AssertionError("not called")
+            )
+            retry_manifest, count = enrich_missing_concepts(
+                catalog_path=Path("unused.duckdb"),
+                missing_view="silver.missing",
+                output_root=Path(directory),
+                source_run_id="all-persisted-run",
+                classifier_version="grocery-v1",
+                batch_size=1,
+                client=retry_client,
+            )
+
+            self.assertEqual(count, 1)
+            self.assertTrue(retry_manifest.is_file())
+            self.assertTrue((manifest_path.parent / "_SUCCESS").is_file())
+
+    def test_empty_missing_set_completes_without_calling_ollama(self):
+        client = FakeOllamaClient()
+        client.model_digest = unittest.mock.Mock(side_effect=AssertionError("not called"))
+        with TemporaryDirectory() as directory, patch(
+            "grocery_sale_scraper.enrichment.load_missing_concepts",
+            return_value=[],
+        ):
+            manifest_path, count = enrich_missing_concepts(
+                catalog_path=Path("unused.duckdb"),
+                missing_view="silver.missing",
+                output_root=Path(directory),
+                source_run_id="empty-run",
+                classifier_version="grocery-v1",
+                batch_size=10,
+                client=client,
+            )
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(count, 0)
+            self.assertIsNone(manifest["model_digest"])
+            self.assertEqual(client.chat_calls, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+================================================================================
+FILE: tests/test_flipp.py
+================================================================================
+
+import json
+from datetime import datetime
+from email.message import Message
+from pathlib import Path
+import unittest
+
+from grocery_sale_scraper.config import load_config
+from grocery_sale_scraper.flipp import (
+    enriched_item,
+    listing_flyers,
+    normalize_detail_items,
+    select_flyers,
+)
+from grocery_sale_scraper.http import JsonDocument
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+CONFIG = Path(__file__).parents[1] / "config" / "config.example.toml"
+
+
+def document(name: str) -> JsonDocument:
+    body = (FIXTURES / name).read_bytes()
+    return JsonDocument(
+        url="https://example.invalid",
+        fetched_at="2026-08-25T16:00:00Z",
+        status=200,
+        attempts=1,
+        headers={},
+        body=body,
+        value=json.loads(body),
+    )
+
+
+class FlippTests(unittest.TestCase):
+    def test_selects_active_allowlisted_grocery_flyers(self):
+        config = load_config(CONFIG)
+        flyers = listing_flyers(document("listing.json"))
+        result = select_flyers(
+            flyers,
+            config,
+            observed_at=datetime.fromisoformat("2026-08-25T16:00:00+00:00"),
+        )
+
+        self.assertEqual([flyer.flyer_id for flyer in result.selected], [101])
+        self.assertEqual(result.missing_required_merchants, ("food-basics",))
+
+    def test_enriched_item_retains_unrecognized_source_fields(self):
+        config = load_config(CONFIG)
+        flyer = select_flyers(
+            listing_flyers(document("listing.json")),
+            config,
+            observed_at=datetime.fromisoformat("2026-08-25T16:00:00+00:00"),
+        ).selected[0]
+        item = normalize_detail_items(document("flyer_101.json"))[0]
+        result = enriched_item(
+            item,
+            flyer,
+            location_id="home",
+            observed_at="2026-08-25T16:00:00Z",
+        )
+
+        self.assertEqual(result["price"], "3.99")
+        self.assertEqual(result["source_item"]["unknown_item_field"], {"retained": True})
+        self.assertEqual(len(result["item_fingerprint"]), 64)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+================================================================================
+FILE: tests/test_http.py
+================================================================================
+
+from email.message import Message
+import json
+import unittest
+
+from grocery_sale_scraper.config import HttpConfig
+from grocery_sale_scraper.http import fetch_json
+
+
+class FakeResponse:
+    def __init__(self, body: bytes):
+        self.status = 200
+        self.headers = Message()
+        self.headers["Content-Type"] = "application/json"
+        self.headers["Set-Cookie"] = "secret=value"
+        self.headers["Content-Length"] = str(len(body))
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, limit: int) -> bytes:
+        return self.body[:limit]
+
+
+class HttpTests(unittest.TestCase):
+    def test_preserves_exact_bytes_and_excludes_cookie_headers(self):
+        body = b'{"flyers": [], "spacing": "preserved"}\n'
+        result = fetch_json(
+            "https://example.invalid/data",
+            HttpConfig(max_attempts=1),
+            opener=lambda *_args, **_kwargs: FakeResponse(body),
+        )
+
+        self.assertEqual(result.body, body)
+        self.assertEqual(result.value, json.loads(body))
+        self.assertEqual(result.headers["content-type"], "application/json")
+        self.assertNotIn("set-cookie", result.headers)
+
+    def test_rejects_oversized_response(self):
+        with self.assertRaisesRegex(RuntimeError, "exceeds"):
+            fetch_json(
+                "https://example.invalid/data",
+                HttpConfig(max_attempts=1, max_response_bytes=1024),
+                opener=lambda *_args, **_kwargs: FakeResponse(b"x" * 1025),
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+================================================================================
+FILE: tests/test_ollama.py
+================================================================================
+
+import io
+import json
+import unittest
+
+from grocery_sale_scraper.ollama import OllamaClient, OllamaConfig
+
+
+class FakeResponse:
+    status = 200
+
+    def __init__(self, value):
+        self.body = json.dumps(value).encode()
+        self.headers = {"Content-Length": str(len(self.body))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self, size=-1):
+        return io.BytesIO(self.body).read(size)
+
+
+class OllamaTests(unittest.TestCase):
+    def test_finds_exact_model_digest(self):
+        def opener(request, timeout):
+            self.assertEqual(request.full_url, "http://ollama:11434/api/tags")
+            return FakeResponse(
+                {"models": [{"name": "gemma4:12b-it-q8_0", "digest": "digest-1"}]}
+            )
+
+        client = OllamaClient(
+            OllamaConfig("http://ollama:11434", "gemma4:12b-it-q8_0"),
+            opener=opener,
+        )
+        self.assertEqual(client.model_digest(), "digest-1")
+
+    def test_posts_non_streaming_schema_constrained_chat(self):
+        def opener(request, timeout):
+            payload = json.loads(request.data)
+            self.assertFalse(payload["stream"])
+            self.assertEqual(
+                payload["options"], {"temperature": 0, "num_ctx": 32_768}
+            )
+            self.assertEqual(payload["format"], {"type": "object"})
+            return FakeResponse({"message": {"content": '{"items":[]}'}})
+
+        client = OllamaClient(
+            OllamaConfig("http://ollama:11434", "model"),
+            opener=opener,
+        )
+        self.assertEqual(
+            client.chat(system="system", prompt="prompt", schema={"type": "object"}),
+            {"items": []},
+        )
+
+    def test_warms_model_with_an_empty_non_streaming_generate_request(self):
+        def opener(request, timeout):
+            self.assertEqual(request.full_url, "http://ollama:11434/api/generate")
+            self.assertEqual(timeout, 600.0)
+            self.assertEqual(
+                json.loads(request.data),
+                {
+                    "model": "model",
+                    "prompt": "",
+                    "stream": False,
+                    "keep_alive": "10m",
+                    "options": {"num_ctx": 32_768},
+                },
+            )
+            return FakeResponse({"model": "model", "done": True})
+
+        client = OllamaClient(OllamaConfig("http://ollama:11434", "model"), opener=opener)
+        self.assertEqual(client.warm_model(), {"model": "model", "done": True})
+
+    def test_grows_context_only_when_the_request_needs_it(self):
+        client = OllamaClient(OllamaConfig("http://ollama:11434", "model"))
+        self.assertEqual(client._context_size_for("system", "short"), 32_768)
+        self.assertEqual(client._context_size_for("", "x" * 80_000), 65_536)
+        self.assertEqual(client._context_size_for("", "x" * 400_000), 131_072)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
