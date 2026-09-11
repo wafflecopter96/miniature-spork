@@ -1,0 +1,319 @@
+]633;E;echo "=== COMMIT ===";f9441f6b-cba4-4110-8263-8bd87b934666]633;C=== COMMIT ===
+2cc620850f95a16c74152e0136e1fc0c8187dad5
+
+=== STATUS ===
+## feature/retry-behaviour
+?? retry-safety-work-packages-review.txt
+
+=== COMMIT + FULL DIFF ===
+commit 2cc620850f95a16c74152e0136e1fc0c8187dad5
+Author:     . <.@gmail.com>
+AuthorDate: Fri Sep 11 12:20:55 2026 -0400
+Commit:     . <.@gmail.com>
+CommitDate: Fri Sep 11 12:20:55 2026 -0400
+
+    Luna changes 3/3
+---
+ docs/RETRY_CONTRACT.md                   |  25 +++
+ tests/test_postgres_retry_integration.py | 262 +++++++++++++++++++++++++++++++
+ 2 files changed, 287 insertions(+)
+
+diff --git a/docs/RETRY_CONTRACT.md b/docs/RETRY_CONTRACT.md
+new file mode 100644
+index 0000000..31f62f3
+--- /dev/null
++++ b/docs/RETRY_CONTRACT.md
+@@ -0,0 +1,25 @@
++# PostgreSQL retry contract
++
++`RUN_ID` is immutably bound to the complete deterministic run definition and
++its `run_definition_sha256` before provider work begins. Each claimed attempt
++holds a namespaced, nonblocking PostgreSQL session advisory lock on one
++autocommit connection. Request documents are durable checkpoints: retries
++validate and reuse valid documents, fetching only missing requests. A valid
++empty response is still a completed checkpoint. Succeeded runs are terminal;
++legacy or unverifiable runs require a new `RUN_ID`.
++
++Counters describe the logical retry: `planned` is the canonical plan size,
++`reused` is the valid checkpoint count loaded initially, `executed` is newly
++committed work in this attempt, `completed` is the final durable checkpoint
++count, `failed` is `planned - completed`, and `provider_attempts` counts only
++this attempt's collector invocations. Reused observation counts come from
++checkpoint metadata. With `FAIL_ON_PARTIAL=true`, any remaining logical failure
++is nonzero; with it false, partial durable success is successful, but zero
++durable completion remains nonzero.
++
++Runs created before definition persistence was introduced are unverifiable and
++cannot be resumed under the new contract; use a new `RUN_ID`. Advisory locking
++is cooperative: mixed old/new writers are not guaranteed safe because older
++application versions do not acquire the lock. A provider response obtained
++before a database commit failure may need to be fetched again. This is durable
++checkpoint resume, not exactly-once upstream execution.
+diff --git a/tests/test_postgres_retry_integration.py b/tests/test_postgres_retry_integration.py
+new file mode 100644
+index 0000000..e61b694
+--- /dev/null
++++ b/tests/test_postgres_retry_integration.py
+@@ -0,0 +1,262 @@
++import os
++from dataclasses import replace
++from hashlib import sha256
++from uuid import uuid4
++
++import pytest
++
++from flight_price_tracker.determinism import fingerprint
++from flight_price_tracker.errors import (
++    StorageConflictError,
++    StorageIdentityError,
++)
++from flight_price_tracker.storage.postgres import (
++    RawDocument,
++    RawLandingError,
++    RawLandingSink,
++    _ConnectionSettings,
++)
++
++
++TEST_DATABASE_ENV = "FLIGHT_PRICE_TRACKER_TEST_DATABASE_URL"
++PRODUCER = "flight-price-tracker"
++
++
++@pytest.fixture
++def pg_case():
++    database_url = os.environ.get(TEST_DATABASE_ENV, "").strip()
++    if not database_url:
++        pytest.skip(f"{TEST_DATABASE_ENV} is not set")
++    psycopg = pytest.importorskip("psycopg")
++    sink = RawLandingSink(
++        PRODUCER,
++        "retry-integration-test",
++        _ConnectionSettings(database_url=database_url),
++    )
++    sink.ensure_schema()
++    run_ids = []
++
++    def new_run_id():
++        run_id = f"wp3-{uuid4().hex}"
++        run_ids.append(run_id)
++        return run_id
++
++    try:
++        yield sink, database_url, new_run_id
++    finally:
++        with psycopg.connect(database_url, autocommit=True) as connection:
++            for run_id in run_ids:
++                connection.execute(
++                    "DELETE FROM raw.json_documents WHERE producer = %s AND run_id = %s",
++                    (PRODUCER, run_id),
++                )
++                connection.execute(
++                    "DELETE FROM raw.ingestion_runs WHERE producer = %s AND run_id = %s",
++                    (PRODUCER, run_id),
++                )
++
++
++def run_definition(label="one"):
++    return {
++        "schema_version": 2,
++        "label": label,
++        "requests": [{"request_key": "request-key-a", "value": label}],
++    }
++
++
++def claim(sink, run_id, definition=None):
++    definition = run_definition() if definition is None else definition
++    return sink.claim_run(
++        run_id,
++        definition,
++        fingerprint(definition),
++        "2026-09-11T12:01:00Z",
++    )
++
++
++def request_document(run_id, payload_text='{ "amount": 1.00 }'):
++    payload = payload_text.encode("utf-8")
++    return RawDocument(
++        run_id=run_id,
++        document_key="request/request-key-a",
++        stream="flight.test.search-response",
++        source_record_id="test/source",
++        observed_at="2026-09-11T12:00:00Z",
++        fetched_at="2026-09-11T12:01:00Z",
++        payload_text=payload_text,
++        payload_sha256=sha256(payload).hexdigest(),
++        payload_bytes=len(payload),
++        metadata={
++            "request_key": "request-key-a",
++            "request_definition": {"value": "one"},
++            "accepted_observation_count": 0,
++        },
++    )
++
++
++def test_advisory_lock_contention_and_nonterminal_reclaim(pg_case):
++    sink, _, new_run_id = pg_case
++    run_id = new_run_id()
++    first = claim(sink, run_id)
++    second_sink = RawLandingSink(
++        PRODUCER, "retry-integration-test", _ConnectionSettings(database_url=sink.settings.database_url)
++    )
++    try:
++        with pytest.raises(StorageConflictError):
++            claim(second_sink, run_id)
++        assert sink.run_status(run_id) == "running"
++    finally:
++        first.release()
++    second = claim(second_sink, run_id)
++    assert second.status == "running"
++    second.release()
++
++
++def test_independent_run_ids_can_be_owned_simultaneously(pg_case):
++    sink, _, new_run_id = pg_case
++    first = claim(sink, new_run_id())
++    second = claim(sink, new_run_id())
++    try:
++        assert first.connection is not second.connection
++        assert first.status == second.status == "running"
++    finally:
++        first.release()
++        second.release()
++
++
++def test_normal_and_exceptional_context_exit_release_lock(pg_case):
++    sink, _, new_run_id = pg_case
++    normal_id = new_run_id()
++    with claim(sink, normal_id):
++        pass
++    normal_again = claim(sink, normal_id)
++    normal_again.release()
++
++    exceptional_id = new_run_id()
++    with pytest.raises(RuntimeError, match="body failure"):
++        with claim(sink, exceptional_id):
++            raise RuntimeError("body failure")
++    exceptional_again = claim(sink, exceptional_id)
++    exceptional_again.release()
++
++
++def test_stale_running_session_can_be_reclaimed(pg_case):
++    sink, _, new_run_id = pg_case
++    run_id = new_run_id()
++    abandoned = claim(sink, run_id)
++    abandoned.connection.close()
++    recovered = claim(sink, run_id)
++    assert recovered.status == "running"
++    recovered.release()
++
++
++def test_succeeded_is_terminal_and_definition_mismatch_is_unchanged(pg_case):
++    sink, _, new_run_id = pg_case
++    run_id = new_run_id()
++    definition = run_definition()
++    attempt = claim(sink, run_id, definition)
++    attempt.complete("succeeded", {"marker": "done"}, 1)
++    attempt.release()
++
++    matching = claim(sink, run_id, definition)
++    assert matching.status == "succeeded"
++    with pytest.raises(RawLandingError, match="already succeeded"):
++        matching.complete("partial", {}, 0)
++    with pytest.raises(RawLandingError, match="already succeeded"):
++        matching.fail(RuntimeError("must not downgrade"))
++    matching.release()
++
++    changed = run_definition("changed")
++    with pytest.raises(StorageIdentityError, match="different run definition"):
++        claim(sink, run_id, changed)
++    final = claim(sink, run_id, definition)
++    assert final.status == "succeeded"
++    final.release()
++
++
++def test_definition_persists_and_survives_partial_and_failed_reclaim(pg_case):
++    sink, _, new_run_id = pg_case
++    run_id = new_run_id()
++    definition = run_definition()
++    expected_hash = fingerprint(definition)
++    attempt = claim(sink, run_id, definition)
++    assert attempt.manifest["run_definition"] == definition
++    assert attempt.manifest["run_definition_sha256"] == expected_hash
++    attempt.complete("partial", {"attempt": 1}, 0)
++    attempt.release()
++
++    partial = claim(sink, run_id, definition)
++    assert partial.status == "running"
++    assert partial.manifest["run_definition"] == definition
++    partial.fail(RuntimeError("attempt failed"))
++    partial.release()
++
++    failed = claim(sink, run_id, definition)
++    assert failed.status == "running"
++    assert failed.manifest["run_definition_sha256"] == expected_hash
++    failed.release()
++
++
++def test_json_payload_text_hash_and_byte_count_round_trip(pg_case):
++    pytest.importorskip("fast_flights")
++    pytest.importorskip("selectolax")
++    from flight_price_tracker.service import _validated_checkpoints
++
++    sink, _, new_run_id = pg_case
++    run_id = new_run_id()
++    definition = run_definition()
++    payload_text = '{  "amount": 1.00, "note": "lexical text"  }\n'
++    attempt = claim(sink, run_id, definition)
++    document = request_document(run_id, payload_text)
++    attempt.write_document(document)
++    rows = attempt.load_request_documents()
++    assert rows[0]["payload_text"] == payload_text
++    assert rows[0]["payload_text"].encode("utf-8") == payload_text.encode("utf-8")
++    assert rows[0]["payload_sha256"] == sha256(payload_text.encode("utf-8")).hexdigest()
++    assert rows[0]["payload_bytes"] == len(payload_text.encode("utf-8"))
++    assert len(_validated_checkpoints(rows, definition)) == 1
++    attempt.release()
++
++
++def test_identical_document_replay_is_accepted_but_changed_payload_rejected(pg_case):
++    sink, _, new_run_id = pg_case
++    run_id = new_run_id()
++    attempt = claim(sink, run_id)
++    original = request_document(run_id)
++    attempt.write_document(original)
++    attempt.write_document(original)
++    changed_text = '{ "amount": 2.00 }'
++    changed_payload = changed_text.encode("utf-8")
++    changed = replace(
++        original,
++        payload_text=changed_text,
++        payload_sha256=sha256(changed_payload).hexdigest(),
++        payload_bytes=len(changed_payload),
++    )
++    with pytest.raises(RawLandingError, match="raw document conflict"):
++        attempt.write_document(changed)
++    attempt.release()
++
++
++def test_legacy_run_is_rejected_unchanged(pg_case):
++    sink, database_url, new_run_id = pg_case
++    psycopg = pytest.importorskip("psycopg")
++    run_id = new_run_id()
++    with psycopg.connect(database_url, autocommit=True) as connection:
++        connection.execute(
++            """
++            INSERT INTO raw.ingestion_runs (
++                producer, run_id, application_version, status, started_at, manifest
++            ) VALUES (%s, %s, %s, 'failed', %s, %s::jsonb)
++            """,
++            (PRODUCER, run_id, "legacy-test", "2026-09-11T12:00:00Z", "{}"),
++        )
++    with pytest.raises(StorageIdentityError, match="use a new RUN_ID"):
++        claim(sink, run_id)
++    with psycopg.connect(database_url, autocommit=True) as connection:
++        row = connection.execute(
++            "SELECT status, manifest FROM raw.ingestion_runs WHERE producer = %s AND run_id = %s",
++            (PRODUCER, run_id),
++        ).fetchone()
++    assert row[0] == "failed"
++    assert row[1] == {}
